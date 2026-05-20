@@ -24,8 +24,8 @@ import importlib
 
 from .mmdit_async_offload import async_save_on_cpu
 
-# vllm-omni unified attention
-from vllm_omni.diffusion.attention.layer import Attention
+# vllm-omni unified attention (aliased to avoid shadowing local Attention class)
+from vllm_omni.diffusion.attention.layer import Attention as VllmAttention
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 
 try:
@@ -222,7 +222,7 @@ class CrossAttention(nn.Module):
 
         # vllm-omni unified attention (kernel replacement)
         head_dim = n_embd // n_head
-        self.vllm_attn = Attention(
+        self.vllm_attn = VllmAttention(
             num_heads=n_head,
             head_size=head_dim,
             causal=False,
@@ -737,7 +737,7 @@ class SelfAttention(nn.Module):
 
         # vllm-omni unified attention (kernel replacement)
         head_dim = n_embd // n_head
-        self.vllm_attn = Attention(
+        self.vllm_attn = VllmAttention(
             num_heads=n_head,
             head_size=head_dim,
             causal=False,
@@ -943,7 +943,7 @@ class JoinAttention(nn.Module):
         head_dim = n_embd // n_head
 
         # vllm-omni unified attention (kernel replacement)
-        self.vllm_attn = Attention(
+        self.vllm_attn = VllmAttention(
             num_heads=n_head,
             head_size=head_dim,
             causal=False,
