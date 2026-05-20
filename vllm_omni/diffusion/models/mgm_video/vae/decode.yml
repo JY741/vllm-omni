@@ -1,0 +1,70 @@
+common:
+    output_path: '../output/cloud/mimo'
+    save_per_epochs: 0.1
+    eval_per_epochs: 1
+    eval_first: 1
+
+    use_fp16: 1
+    use_zero: 0
+    use_deepspeed: 0
+    deepspeed_config: 'configs/deepspeed/zero2-mimo.json'
+    deepspeed_merge_save: True
+    use_fsdp: 0
+    random_seed: 1231111666
+    log_interval: 10
+    machines: 16
+    task: 'vae_video_pretrain'
+    delete_after_upload: 0
+    use_profile: 0
+    profile_skip_first: 3
+    profile_wait: 3
+    profile_warmup: 3
+    profile_active: 3
+    profile_repeat: 1
+
+only_decoder: False
+
+model_config:
+    # pretrain_model:
+    only_decoder: False
+    target: vllm_omni.diffusion.models.mgm_video.vae.vae_model.AutoencoderKL3D
+    ckpt_path_local: /cache/ckpts/motion_vae.pth
+    ckpt_path_cloud: s3://bucket-5125-guiyang/code/f00830858/causal_vae_v3.1_sd3.pth
+    params:
+      monitor: "val/rec_loss"
+      embed_dim: 16
+      inflation: True
+      mode: last_slice
+      lossconfig:
+        target: torch.nn.Identity
+        params:
+          disc_start: 5000000000001
+          kl_weight: 0.000001
+          disc_weight: 0.0
+
+      ddconfig:
+        double_z: True
+        z_channels: 16
+        resolution: 256
+        in_channels: 3
+        out_ch: 3
+        ch: 128
+        ch_mult: [ 1,2,4,4 ]  # num_down = len(ch_mult)-1
+        num_res_blocks: 2
+        attn_resolutions: [ ]
+        dropout: 0.0
+        attn_type: 3d
+        num_resize: 3
+        spynet_pretrained_local: /home/j00935189/t2v/T2V/spynet_20210409-c6c1bd09.pth
+        spynet_pretrained_cloud: s3://bucket-5125-guiyang/outputs/x00520376/VAE/ckpts/spynet_20210409-c6c1bd09.pth
+
+infer_config:
+  communication_type: send_recv
+  infer_type: op
+  deterministic: 0
+  permute_hw: 0
+
+data_config:
+  split_type: split_t
+  is_pad: 0
+  permute_hw: 0
