@@ -24,6 +24,10 @@ import importlib
 
 from .mmdit_async_offload import async_save_on_cpu
 
+# vllm-omni unified attention
+from vllm_omni.diffusion.attention.layer import Attention
+from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+
 try:
     '''ascend'''
     import torch_npu
@@ -216,7 +220,21 @@ class CrossAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
-    def forward(self, x, y, mask):
+        # vllm-omni unified attention (kernel replacement)
+        head_dim = n_embd // n_head
+        self.vllm_attn = Attention(
+            num_heads=n_head,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=head_dim ** -0.5,
+            num_kv_heads=n_head,
+            role="cross",
+            qkv_layout="BNSD",
+            skip_sequence_parallel=True,
+        )
+
+    def _original_forward(self, x, y, mask):
+        """Original attention implementation (fallback)."""
         B, T, C = x.size()
         _, L, _ = y.size()
         q = self.q_linear(x)
@@ -234,6 +252,33 @@ class CrossAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_drop(att)
             out = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        x = out.transpose(1, 2).contiguous().view(B, T, C)
+
+        # output projection
+        x = self.proj_drop(self.proj(x))
+        return x
+
+    def forward(self, x, y, mask):
+        if os.environ.get("MGM_USE_ORIGINAL_ATTN", "0") == "1":
+            return self._original_forward(x, y, mask)
+
+        B, T, C = x.size()
+        _, L, _ = y.size()
+        q = self.q_linear(x)
+        k, v = self.kv_linear(y).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, L, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, L, self.n_head, C // self.n_head).transpose(1, 2)
+
+        # mgm_video uses BNSD; vllm-omni expects BSND
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn_metadata = AttentionMetadata(attn_mask=mask)
+        out = self.vllm_attn.forward(q, k, v, attn_metadata)
+
+        out = out.permute(0, 2, 1, 3)  # back to BNSD
         x = out.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
@@ -690,7 +735,21 @@ class SelfAttention(nn.Module):
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
 
-    def forward(self, x, mask, spatial_freq=None):
+        # vllm-omni unified attention (kernel replacement)
+        head_dim = n_embd // n_head
+        self.vllm_attn = Attention(
+            num_heads=n_head,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=head_dim ** -0.5,
+            num_kv_heads=n_head,
+            role="self",
+            qkv_layout="BNSD",
+            skip_sequence_parallel=True,
+        )
+
+    def _original_forward(self, x, mask, spatial_freq=None):
+        """Original attention implementation (fallback)."""
         B, T, C = x.size()
         q, k, v = self.qkv(x).split(self.n_embd, dim=2)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
@@ -713,6 +772,37 @@ class SelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_drop(att)
             out = att @ v  # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        x = out.transpose(1, 2).contiguous().view(B, T, C)
+
+        # output projection
+        x = self.proj_drop(self.proj(x))
+        return x
+
+    def forward(self, x, mask, spatial_freq=None):
+        if os.environ.get("MGM_USE_ORIGINAL_ATTN", "0") == "1":
+            return self._original_forward(x, mask, spatial_freq)
+
+        B, T, C = x.size()
+        q, k, v = self.qkv(x).split(self.n_embd, dim=2)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)
+
+        if spatial_freq is not None:
+            if True:  # self.use_3d_rope:
+                q, k = apply_3drotary_pos(q, k, freqs_cis=spatial_freq)
+            else:
+                q, k = apply_2drotary_pos(q, k, freqs_cis=spatial_freq)
+
+        # mgm_video uses BNSD; vllm-omni expects BSND
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn_metadata = AttentionMetadata(attn_mask=mask)
+        out = self.vllm_attn.forward(q, k, v, attn_metadata)
+
+        out = out.permute(0, 2, 1, 3)  # back to BNSD
         x = out.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
@@ -851,6 +941,19 @@ class JoinAttention(nn.Module):
         self.fa_keep_prob = fa_keep_prob
         self.depth = depth
         head_dim = n_embd // n_head
+
+        # vllm-omni unified attention (kernel replacement)
+        self.vllm_attn = Attention(
+            num_heads=n_head,
+            head_size=head_dim,
+            causal=False,
+            softmax_scale=head_dim ** -0.5,
+            num_kv_heads=n_head,
+            role="joint",
+            qkv_layout="BNSD",
+            skip_sequence_parallel=True,
+        )
+
         if self.use_qknorm:
             if self.use_rmsnorm:
                 self.norm1 = RMSNorm(head_dim)
@@ -1141,7 +1244,8 @@ class JoinAttention(nn.Module):
             y = torch.mean(y, dim=1)
         return x, y
 
-    def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+    def _original_fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+        """Original attention kernel implementation (fallback)."""
         _is_block0 = getattr(self, '_debug_is_block0', False)
         if self.flash:
             mask = mask.logical_not() if mask != None else None
@@ -1175,6 +1279,24 @@ class JoinAttention(nn.Module):
             att = self.attn_drop(att)
             out = att @ v
 
+        return out
+
+    def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+        """Unified attention kernel via vllm-omni Attention backend."""
+        # Fallback switch for A/B testing or debugging
+        if os.environ.get("MGM_USE_ORIGINAL_ATTN", "0") == "1":
+            return self._original_fa(q, k, v, mask, C, offload_fa, h2d_stream, d2h_stream, num_layer)
+
+        # mgm_video uses BNSD (B,H,S,D); vllm-omni Attention expects BSND (B,S,H,D)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn_metadata = AttentionMetadata(attn_mask=mask)
+        out = self.vllm_attn.forward(q, k, v, attn_metadata)
+
+        # Convert back to BNSD
+        out = out.permute(0, 2, 1, 3)
         return out
 
     def forward(self, x, x1_cts, y, mask, spatial_freq=None, spatial_freq_ctx=None, use_finegrained=False):

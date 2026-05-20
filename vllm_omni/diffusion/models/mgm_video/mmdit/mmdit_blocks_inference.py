@@ -18,7 +18,7 @@ from typing import Tuple
 from torch.nn import functional as F
 from einops import rearrange, repeat
 from .mmdit_communications import all_to_all
-from .mmdit_blocks import JoinAttention, apply_3drotary_pos, apply_2drotary_pos
+from .mmdit_blocks import JoinAttention, apply_3drotary_pos, apply_2drotary_pos, AttentionMetadata
 
 try:
     '''ascend'''
@@ -50,28 +50,46 @@ class JoinAttentionInference(JoinAttention):
                                         op_type="ascend_laser_attention", layout="BNSD")
         return attention_out.transpose(1,2)
 
-    def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+    def _original_fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+        """Original inference attention kernel (fallback)."""
         if self.flash:
             raise NotImplementedError
         elif self.npu_fusion:
-            # q,k,v shape-[B,N,S,D]
             n_head = q.shape[1]
-
             if self.laser_atten:
                 if mask is not None:
                     raise NotImplementedError
-
                 out = self.la(q, k, v)
             else:
                 out = torch_npu.npu_fusion_attention(
-                        q, k, v, n_head,
-                        atten_mask=mask,
-                        scale=(C // self.n_head) ** -0.5,
-                        keep_prob=self.fa_keep_prob,
-                        input_layout="BNSD",
-                    )[0]
+                    q, k, v, n_head,
+                    atten_mask=mask,
+                    scale=(C // self.n_head) ** -0.5,
+                    keep_prob=self.fa_keep_prob,
+                    input_layout="BNSD",
+                )[0]
         else:
             raise NotImplementedError
+        return out
+
+    def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+        """Unified attention kernel via vllm-omni Attention backend."""
+        if os.environ.get("MGM_USE_ORIGINAL_ATTN", "0") == "1":
+            return self._original_fa(q, k, v, mask, C, offload_fa, h2d_stream, d2h_stream, num_layer)
+
+        # laser attention is not supported by vllm-omni; fallback to original
+        if self.laser_atten:
+            return self._original_fa(q, k, v, mask, C, offload_fa, h2d_stream, d2h_stream, num_layer)
+
+        # mgm_video uses BNSD (B,H,S,D); vllm-omni Attention expects BSND (B,S,H,D)
+        q = q.permute(0, 2, 1, 3)
+        k = k.permute(0, 2, 1, 3)
+        v = v.permute(0, 2, 1, 3)
+
+        attn_metadata = AttentionMetadata(attn_mask=mask)
+        out = self.vllm_attn.forward(q, k, v, attn_metadata)
+
+        out = out.permute(0, 2, 1, 3)  # back to BNSD
         return out
 
     def infer(self, x, y, x1_cts, spatial_freq, x_padding_size, y_padding_size, mask, f, hh, ww):
