@@ -27,6 +27,7 @@ from .mmdit_async_offload import async_save_on_cpu
 # vllm-omni unified attention (aliased to avoid shadowing local Attention class)
 from vllm_omni.diffusion.attention.layer import Attention as VllmAttention
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+from vllm_omni.diffusion.attention.parallel.base import NoParallelAttention
 
 try:
     '''ascend'''
@@ -228,10 +229,9 @@ class CrossAttention(nn.Module):
             causal=False,
             softmax_scale=head_dim ** -0.5,
             num_kv_heads=n_head,
-            role="cross",
-            qkv_layout="BNSD",
-            skip_sequence_parallel=True,
         )
+        # Disable vllm-omni SP; mgm_video handles CP in before_fa/after_fa
+        self.vllm_attn.parallel_strategy = NoParallelAttention()
 
     def _original_forward(self, x, y, mask):
         """Original attention implementation (fallback)."""
@@ -743,10 +743,9 @@ class SelfAttention(nn.Module):
             causal=False,
             softmax_scale=head_dim ** -0.5,
             num_kv_heads=n_head,
-            role="self",
-            qkv_layout="BNSD",
-            skip_sequence_parallel=True,
         )
+        # Disable vllm-omni SP; mgm_video handles CP in before_fa/after_fa
+        self.vllm_attn.parallel_strategy = NoParallelAttention()
 
     def _original_forward(self, x, mask, spatial_freq=None):
         """Original attention implementation (fallback)."""
@@ -949,10 +948,9 @@ class JoinAttention(nn.Module):
             causal=False,
             softmax_scale=head_dim ** -0.5,
             num_kv_heads=n_head,
-            role="joint",
-            qkv_layout="BNSD",
-            skip_sequence_parallel=True,
         )
+        # Disable vllm-omni SP; mgm_video handles CP in before_fa/after_fa
+        self.vllm_attn.parallel_strategy = NoParallelAttention()
 
         if self.use_qknorm:
             if self.use_rmsnorm:
