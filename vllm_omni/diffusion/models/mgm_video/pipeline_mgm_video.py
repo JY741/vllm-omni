@@ -109,28 +109,30 @@ def create_transformer_from_config(
 
 
 def get_mgm_video_post_process_func(od_config: OmniDiffusionConfig):
-    """Post-process function for MGM-Video: convert video tensor to uint8 numpy.
-    1. Clamp to [-1, 1]
-    2. Map [-1, 1] -> [0, 1]: (x - (-1)) / (1 - (-1))
-    3. Map [0, 1] -> [0, 255]: x * 255 + 0.5 (round compensation), clamp, uint8
+    """Post-process function for MGM-Video.
 
-    Output is uint8 numpy of shape [B, T, H, W, C] with values in [0, 255].
+    forward() 中已在 NPU 上完成的后处理：
+      clamp → normalize → uint8 → permute → CPU
+
+    本函数通过 dtype 检测状态：
+      - uint8：NPU 后处理已完成，直接转 numpy
+      - float32：兜底路径，执行完整 CPU 后处理
     """
 
     def post_process_func(video: torch.Tensor, output_type: str = "np"):
         if output_type == "latent":
             return video
 
-        # video shape: [B, C, T, H, W], value range approximately [-1, 1]
+        # forward() 已在 NPU 上完成后处理（dtype=uint8, 已 permute+CPU）
+        if video.dtype == torch.uint8:
+            return video.numpy()
+
+        # 兜底：原始 VAE 输出，执行完整后处理
         low, high = -1.0, 1.0
         video = torch.clamp(video, min=low, max=high)
-        # Map [-1, 1] -> [0, 1]
         video = video.sub(low).div(max(high - low, 1e-5))
-        # Map [0, 1] -> [0, 255] with round compensation (matches original repo)
         video = video.mul(255).add(0.5).clamp(0, 255)
-        # [B, C, T, H, W] -> [B, T, H, W, C]
         video = video.permute(0, 2, 3, 4, 1)
-        # Convert to uint8 numpy
         video = video.to("cpu", torch.uint8).numpy()
         return video
 
@@ -720,15 +722,17 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
             # Doing this on GPU is ~20x faster than CPU (NPU parallel vs
             # serial memory traversal), and reduces the data transferred
             # through IPC from 1.27 GB (float32) to 334 MB (uint8) for
-            # 121-frame 720p video. The engine-side post_process_func
-            # will detect the pre-processed uint8 tensor and skip.
+            # 121-frame 720p video.
+            #
+            # get_mgm_video_post_process_func() detects the pre-processed
+            # uint8 tensor (via dtype check) and skips redundant ops.
             output = torch.clamp(output, min=-1.0, max=1.0)
             output = output.sub(-1.0).div(2.0)  # [-1,1] -> [0,1]
             output = output.mul(255).add(0.5).clamp(0, 255)
             output = output.permute(0, 2, 3, 4, 1)  # [B,C,T,H,W] -> [B,T,H,W,C]
             output = output.to(torch.uint8).cpu()
 
-        return DiffusionOutput(output=output, _post_processed=(output_type != "latent"))
+        return DiffusionOutput(output=output)
 
     def load_weights(self, weights):
         """Load weights using the vLLM AutoWeightsLoader.
