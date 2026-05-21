@@ -881,6 +881,19 @@ class JoinAttention(nn.Module):
         if self.downscale == 1:
             self.down_mode = None
 
+        # vllm-omni attention backend (optional replacement for fa kernel)
+        self.use_vllm_attn = os.environ.get("VLLM_MGM_USE_NATIVE_FA", "0") != "1"
+        if self.use_vllm_attn:
+            from vllm_omni.diffusion.attention.selector import get_attn_backend
+            head_dim = n_embd // n_head
+            backend_cls = get_attn_backend(head_size=head_dim)
+            self.vllm_attn = backend_cls.get_impl_cls()(
+                num_heads=n_head,
+                head_size=head_dim,
+                causal=False,
+                softmax_scale=head_dim ** -0.5,
+            )
+
         if self.downscale != 1:
             self.sparse_n = self.downscale
             self.sparse_n_2 = int(self.sparse_n ** 0.5)
