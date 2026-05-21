@@ -884,10 +884,12 @@ class JoinAttention(nn.Module):
         # vllm-omni attention backend (optional replacement for fa kernel)
         self.use_vllm_attn = os.environ.get("VLLM_MGM_USE_NATIVE_FA", "0") != "1"
         if self.use_vllm_attn:
-            from vllm_omni.diffusion.attention.selector import get_attn_backend
+            from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend
             head_dim = n_embd // n_head
-            backend_cls = get_attn_backend(head_size=head_dim)
-            self.vllm_attn = backend_cls.get_impl_cls()(
+            # Use SDPA backend: on NPU torch SDPA delegates to npu_fusion_attention
+            # (verified equivalent), while FlashAttentionBackend uses mindiesd
+            # which produces numerically different results.
+            self.vllm_attn = SDPABackend.get_impl_cls()(
                 num_heads=n_head,
                 head_size=head_dim,
                 causal=False,
