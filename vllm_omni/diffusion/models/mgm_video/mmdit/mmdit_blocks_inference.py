@@ -56,10 +56,15 @@ class JoinAttentionInference(JoinAttention):
             if mask is not None:
                 mask = mask.logical_not()
             metadata = AttentionMetadata(attn_mask=mask)
-            return self.vllm_attn(q, k, v, metadata)
+            q_bsnd = q.permute(0, 2, 1, 3)
+            k_bsnd = k.permute(0, 2, 1, 3)
+            v_bsnd = v.permute(0, 2, 1, 3)
+            out = self.vllm_attn.forward(q_bsnd, k_bsnd, v_bsnd, metadata)
+            return out.permute(0, 2, 1, 3)
 
         if self.flash:
-            raise NotImplementedError
+            mask = mask.logical_not() if mask != None else None
+            out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=1 - self.fa_keep_prob)
         elif self.npu_fusion:
             # q,k,v shape-[B,N,S,D]
             n_head = q.shape[1]

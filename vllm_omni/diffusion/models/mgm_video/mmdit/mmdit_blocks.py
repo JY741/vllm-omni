@@ -1162,7 +1162,13 @@ class JoinAttention(nn.Module):
             if mask is not None:
                 mask = mask.logical_not()
             metadata = AttentionMetadata(attn_mask=mask)
-            return self.vllm_attn(q, k, v, metadata)
+            # vllm-omni SDPA backend expects BSND [B, S, N, D] input format,
+            # while mmdit produces BNSD [B, N, S, D]. Permute before calling.
+            q_bsnd = q.permute(0, 2, 1, 3)
+            k_bsnd = k.permute(0, 2, 1, 3)
+            v_bsnd = v.permute(0, 2, 1, 3)
+            out = self.vllm_attn.forward(q_bsnd, k_bsnd, v_bsnd, metadata)
+            return out.permute(0, 2, 1, 3)
 
         if self.flash:
             mask = mask.logical_not() if mask != None else None
