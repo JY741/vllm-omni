@@ -51,6 +51,13 @@ class JoinAttentionInference(JoinAttention):
         return attention_out.transpose(1,2)
 
     def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
+        if self.use_vllm_attn:
+            from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+            if mask is not None:
+                mask = mask.logical_not()
+            metadata = AttentionMetadata(attn_mask=mask)
+            return self.vllm_attn(q, k, v, metadata)
+
         if self.flash:
             raise NotImplementedError
         elif self.npu_fusion:
