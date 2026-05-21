@@ -1156,6 +1156,14 @@ class JoinAttention(nn.Module):
 
     def fa(self, q, k, v, mask, C, offload_fa, h2d_stream=None, d2h_stream=None, num_layer=-1):
         _is_block0 = getattr(self, '_debug_is_block0', False)
+        if self.use_vllm_attn:
+            from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
+            # mask semantic conversion: mmdit True=masked -> vllm-omni True=keep
+            if mask is not None:
+                mask = mask.logical_not()
+            metadata = AttentionMetadata(attn_mask=mask)
+            return self.vllm_attn(q, k, v, metadata)
+
         if self.flash:
             mask = mask.logical_not() if mask != None else None
             out = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=mask, dropout_p=1 - self.fa_keep_prob)
