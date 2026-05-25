@@ -18,7 +18,8 @@ from typing import Tuple
 from torch.nn import functional as F
 from einops import rearrange, repeat
 from .mmdit_communications import all_to_all
-from .mmdit_blocks import JoinAttention, apply_3drotary_pos, apply_2drotary_pos
+from .mmdit_blocks import JoinAttention
+from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 
 try:
     '''ascend'''
@@ -41,6 +42,7 @@ class JoinAttentionInference(JoinAttention):
             downscale=downscale, index=index
         )
         self.laser_atten = laser_atten
+        self.rope = RotaryEmbedding(is_neox_style=False)
 
     def la(self, query, key, value):
         query = query.transpose(1,2)
@@ -86,6 +88,35 @@ class JoinAttentionInference(JoinAttention):
             raise NotImplementedError
         return out
 
+    def _apply_3d_rope(self, q, k, spatial_freq):
+        """Apply 3D RoPE using vllm-omni RotaryEmbedding.
+
+        Args:
+            q, k: [B, S, N, D] (BSND layout)
+            spatial_freq: [(cos_h, sin_h), (cos_w, sin_w), (cos_t, sin_t)]
+                each cos/sin: [S, dim/2]
+        Returns:
+            q, k: [B, S, N, D] with RoPE applied
+        """
+        (cos_h, sin_h), (cos_w, sin_w), (cos_t, sin_t) = spatial_freq
+        dim_h = cos_h.shape[-1] * 2
+        dim_w = cos_w.shape[-1] * 2
+        dim_t = cos_t.shape[-1] * 2
+
+        q_h, q_w, q_t = q.split([dim_h, dim_w, dim_t], dim=-1)
+        k_h, k_w, k_t = k.split([dim_h, dim_w, dim_t], dim=-1)
+
+        q_h = self.rope(q_h, cos_h, sin_h)
+        k_h = self.rope(k_h, cos_h, sin_h)
+        q_w = self.rope(q_w, cos_w, sin_w)
+        k_w = self.rope(k_w, cos_w, sin_w)
+        q_t = self.rope(q_t, cos_t, sin_t)
+        k_t = self.rope(k_t, cos_t, sin_t)
+
+        q = torch.cat([q_h, q_w, q_t], dim=-1)
+        k = torch.cat([k_h, k_w, k_t], dim=-1)
+        return q, k
+
     def infer(self, x, y, x1_cts, spatial_freq, x_padding_size, y_padding_size, mask, f, hh, ww):
         assert x1_cts is None, "Ulysses sequence parallel is not supported for window attention."
 
@@ -94,8 +125,8 @@ class JoinAttentionInference(JoinAttention):
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         qkv_x_out = self.qkv_x(x)
         q_x, k_x, v_x = qkv_x_out.split(self.n_embd, dim=2)
-        q_x = q_x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        k_x = k_x.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q_x = q_x.view(B, T, self.n_head, C // self.n_head)  # (B, T, nh, hs)
+        k_x = k_x.view(B, T, self.n_head, C // self.n_head)  # (B, T, nh, hs)
         v_x = v_x.view(B, T, self.n_head, C // self.n_head)  # (B, T, nh, hs)
 
 
@@ -103,8 +134,8 @@ class JoinAttentionInference(JoinAttention):
         _, L, _ = y.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         qkv_y_out = self.qkv_y(y)
         q_y, k_y, v_y = qkv_y_out.split(self.n_embd, dim=2)
-        q_y = q_y.view(B, L, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
-        k_y = k_y.view(B, L, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        q_y = q_y.view(B, L, self.n_head, C // self.n_head)  # (B, L, nh, hs)
+        k_y = k_y.view(B, L, self.n_head, C // self.n_head)  # (B, L, nh, hs)
         v_y = v_y.view(B, L, self.n_head, C // self.n_head)  # (B, T, nh, hs)
 
         if self.use_qknorm:
@@ -112,26 +143,19 @@ class JoinAttentionInference(JoinAttention):
 
 
         if spatial_freq is not None:
-
-            if self.use_3d_rope:
-                q_x, k_x = apply_3drotary_pos(q_x, k_x, freqs_cis=spatial_freq)
-            else:
-                q_x, k_x = apply_2drotary_pos(q_x, k_x, freqs_cis=spatial_freq)
+            q_x, k_x = self._apply_3d_rope(q_x, k_x, spatial_freq)
 
 
-        if q_x.shape[1] % self.cp_size != 0:
-            self.x_padding_head = self.cp_size - q_x.shape[1] % self.cp_size
+        if q_x.shape[2] % self.cp_size != 0:
+            self.x_padding_head = self.cp_size - q_x.shape[2] % self.cp_size
         else:
             self.x_padding_head = 0
 
-        if q_y.shape[1] % self.cp_size != 0:
-            self.y_padding_head = self.cp_size - q_y.shape[1] % self.cp_size
+        if q_y.shape[2] % self.cp_size != 0:
+            self.y_padding_head = self.cp_size - q_y.shape[2] % self.cp_size
         else:
             self.y_padding_head = 0
         assert self.x_padding_head == self.y_padding_head
-
-        q_x, k_x = q_x.transpose(1, 2), k_x.transpose(1, 2)
-        q_y, k_y = q_y.transpose(1, 2), k_y.transpose(1, 2)
 
         bs, x_shard_seqlen, hc, hs = q_x.shape
         bs, y_shard_seqlen, hc, hs = q_y.shape

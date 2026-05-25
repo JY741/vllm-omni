@@ -189,7 +189,24 @@ class MMDiTInference(MMDiT):
             self.cache_algo_enable = False
 
 
+    @staticmethod
+    def _convert_spatial_freq_for_inference(spatial_freq):
+        """Convert legacy spatial_freq format to (cos, sin) tuples for RotaryEmbedding.
+
+        Legacy format per axis: [S, 2*dim] where [:, :dim] is sin (interleaved), [:, dim:] is cos (interleaved).
+        Target format per axis: (cos[S, dim/2], sin[S, dim/2]) — non-interleaved half-dim.
+        """
+        result = []
+        for sincos in spatial_freq:
+            dim = sincos.shape[-1] // 2
+            sin_interleaved = sincos[:, :dim]
+            cos_interleaved = sincos[:, dim:]
+            result.append((cos_interleaved[:, ::2].contiguous(), sin_interleaved[:, ::2].contiguous()))
+        return result
+
     def blocks_forward(self, x, y, t, x_padding_size, y_padding_size, mask, spatial_freq, fn, base_size_h, base_size_w, **kwargs):
+        if spatial_freq is not None:
+            spatial_freq = self._convert_spatial_freq_for_inference(spatial_freq)
         # Reset block debug counter for each forward pass (each denoising step)
         MMDiTBlockInference._debug_block_idx = 0
         cur_time_index = kwargs['cur_time_index']
