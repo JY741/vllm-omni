@@ -139,9 +139,6 @@ class OriginalDistributedVAE(nn.Module):
             return DecoderOutput(sample=result)
         return (result,)
 
-    def encode(self, x: torch.Tensor):
-        return self._dist_vae.model.encode(x)
-
     @property
     def dtype(self):
         return self._dtype

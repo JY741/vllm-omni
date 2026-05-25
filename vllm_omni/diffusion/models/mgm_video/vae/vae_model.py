@@ -24,7 +24,6 @@ import torch_npu
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
-from contextlib import contextmanager
 from torch.autograd import Function
 from torch.nn.modules.utils import _pair
 from torch.distributed.distributed_c10d import _get_default_group
@@ -41,62 +40,12 @@ from mmedit.utils import get_root_logger
 
 from vllm_omni.diffusion.models.mgm_video.vae.vae_utils import (
     nonlinearity, time2batch, batch2time, Normalize,
-    DiagonalGaussianDistribution, instantiate_from_config, all_to_all,
+    all_to_all,
 )
-
-try:
-    import moxing as mox
-except:
-    print("no moxing")
-
 
 # ---------------------------------------------------------------------------
 # DCN (Deformable Convolution) modules — originally from dcn.py
 # ---------------------------------------------------------------------------
-
-# from torch.autograd.function import once_differentiable
-# from torch.cuda.amp import custom_fwd
-# from ..models.basic_module.raft_core.utils import bilinear_sampler 
-
-
-# class _DCNv2(Function):
-#     @staticmethod
-#     @custom_fwd(cast_inputs=torch.float32)
-#     def forward(ctx, input, offset, mask, weight, bias, stride, padding,
-#                 dilation, deformable_groups):
-#         ctx.stride = _pair(stride)
-#         ctx.padding = _pair(padding)
-#         ctx.dilation = _pair(dilation)
-#         ctx.kernel_size = _pair(weight.shape[2:4])
-#         ctx.deformable_groups = deformable_groups
-#         output = _backend.dcn_v2_forward(
-#             input, weight, bias, offset, mask, ctx.kernel_size[0],
-#             ctx.kernel_size[1], ctx.stride[0], ctx.stride[1], ctx.padding[0],
-#             ctx.padding[1], ctx.dilation[0], ctx.dilation[1],
-#             ctx.deformable_groups)
-#         ctx.save_for_backward(input, offset, mask, weight, bias)
-#         return output
- 
-#     @staticmethod
-#     @once_differentiable
-#     def backward(ctx, grad_output):
-#         input, offset, mask, weight, bias = ctx.saved_tensors
-#         grad_input, grad_offset, grad_mask, grad_weight, grad_bias = \
-#             _backend.dcn_v2_backward(input, weight,
-#                                      bias,
-#                                      offset, mask,
-#                                      grad_output,
-#                                      ctx.kernel_size[0], ctx.kernel_size[1],
-#                                      ctx.stride[0], ctx.stride[1],
-#                                      ctx.padding[0], ctx.padding[1],
-#                                      ctx.dilation[0], ctx.dilation[1],
-#                                      ctx.deformable_groups)
- 
-#         return grad_input, grad_offset, grad_mask, grad_weight, grad_bias,\
-#             None, None, None, None,
-
-
-# dcn_v2_conv = _DCNv2.apply
 
 
 class DCNv2(nn.Module):
@@ -601,52 +550,10 @@ class SPyNetBasicModule(nn.Module):
 # 3D-specific classes renamed with "3D" suffix.
 # ---------------------------------------------------------------------------
 
-# from taming.modules.vqvae.quantize import VectorQuantizer2 as VectorQuantizer
-
-
-class DiagonalGaussianDistribution3D(DiagonalGaussianDistribution):
-    def kl(self, other=None):
-        if self.deterministic:
-            return torch.Tensor([0.])
-        else:
-            if other is None:
-                return 0.5 * torch.sum(torch.pow(self.mean, 2)
-                                       + self.var - 1.0 - self.logvar,
-                                       dim=[1, 2, 3, 4])
-            else:
-                return 0.5 * torch.sum(
-                    torch.pow(self.mean - other.mean, 2) / other.var
-                    + self.var / other.var - 1.0 - self.logvar + other.logvar,
-                    dim=[1, 2, 3, 4])
-
-
 def interpolate(x, scale_factor):
     return torch.cat([torch.nn.functional.interpolate(xx, scale_factor=scale_factor, mode="nearest") for xx in
                       torch.split(x, 16, dim=1)], dim=1)
 
-
-# class Upsample3D(nn.Module):
-#     def __init__(self, in_channels, with_conv, only_sp=False, only_temp=False):
-#         super().__init__()
-#         self.with_conv = with_conv
-#         self.only_sp = only_sp
-#         self.only_temp = only_temp
-#         if self.with_conv:
-#             self.conv = torch.nn.Conv3d(in_channels,
-#                                         in_channels,
-#                                         kernel_size=3,
-#                                         stride=1,
-#                                         padding=0)
-
-#     def forward(self, x, first_frame=True):
-#         the_type = x.dtype
-#         x = torch.nn.functional.interpolate(x.float(), scale_factor=(1.0,2.0,2.0) if self.only_sp else ((2.0,1.0,1.0) if self.only_temp else 2.0), mode="nearest").to(the_type)
-#         #x = torch.nn.functional.interpolate(x[:,:,0,:,:], scale_factor=2.0).unsqueeze(2) if self.only_sp else torch.nn.functional.interpolate(x.float(), scale_factor=2.0)
-#         #x = interpolate(x.float(), scale_factor=(1.0,2.0,2.0) if self.only_sp else ((2.0,1.0,1.0) if self.only_temp else 2.0)).to(the_type)
-#         if self.with_conv:
-#             x = torch.nn.functional.pad(x, (1,1,1,1,2,0), mode="constant", value=0)
-#             x = self.conv(x)
-#         return x[:,:,1:,:,:] if (not self.only_sp) and first_frame else x
 
 class Upsample3D(nn.Module):
     def __init__(self, in_channels, with_conv, only_sp=False, only_temp=False):
@@ -910,16 +817,6 @@ class AttnBlock3D(nn.Module):
         h_ = self.proj_out(h_)
 
         return x + h_
-
-
-# def nonlinearity(x):
-#     # swish
-#     #return x*torch.sigmoid(x)
-#     return torch.nn.functional.silu(x)
-
-
-# def Normalize(in_channels, num_groups=32):
-#     return torch.nn.GroupNorm(num_groups=num_groups, num_channels=in_channels, eps=1e-6, affine=True)
 
 
 class Upsample2d(nn.Module):
@@ -1598,13 +1495,10 @@ class Decoder_flow(nn.Module):
 
     def post_process(self, h):
         _rank = dist.get_rank() if dist.is_initialized() else 0
-        #print(f"[R{_rank}][VAE-DBG] post_process input: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
         h = self.norm_out(h)
-        #print(f"[R{_rank}][VAE-DBG] post_process after norm_out: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
         h = nonlinearity(h)
         # h = torch.nn.functional.pad(h, (1,1,1,1,2,0), mode="constant", value=0)
         h = self.conv_out(h)
-        #print(f"[R{_rank}][VAE-DBG] post_process after conv_out: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
         if self.tanh_out:
             h = torch.tanh(h)
         return h
@@ -1612,19 +1506,13 @@ class Decoder_flow(nn.Module):
     def pre_process(self, z, temb):
         _rank = dist.get_rank() if dist.is_initialized() else 0
         # z to block_in
-        #print(f"[R{_rank}][VAE-DBG] pre_process input: shape={list(z.shape)}, dtype={z.dtype}, mean={z.float().mean().item():.6f}")
         z = torch.nn.functional.pad(z, (1, 1, 1, 1, 2, 0), mode="constant", value=0)
-        #print(f"[R{_rank}][VAE-DBG] pre_process after F.pad: shape={list(z.shape)}, dtype={z.dtype}, mean={z.float().mean().item():.6f}")
         h = self.conv_in(z)
-        #print(f"[R{_rank}][VAE-DBG] pre_process after conv_in: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
 
         # middle
         h = self.mid.block_1(h, temb)
-        #print(f"[R{_rank}][VAE-DBG] pre_process after mid.block_1: shape={list(h.shape)}, mean={h.float().mean().item():.6f}")
         h = self.mid.attn_1(h)
-        #print(f"[R{_rank}][VAE-DBG] pre_process after mid.attn_1: shape={list(h.shape)}, mean={h.float().mean().item():.6f}")
         h = self.mid.block_2(h, temb)
-        #print(f"[R{_rank}][VAE-DBG] pre_process after mid.block_2: shape={list(h.shape)}, mean={h.float().mean().item():.6f}")
 
         if hasattr(self.mid, 'upsample'):
             h = self.mid.upsample(h, is_casual=self.is_casual)
@@ -1635,7 +1523,6 @@ class Decoder_flow(nn.Module):
     def alignlatent(self, h, flow, is_distributed=False):
         _rank = dist.get_rank() if dist.is_initialized() else 0
         b, c, t, H, W = h.shape
-        #print(f"[R{_rank}][VAE-DBG] alignlatent input: h shape={list(h.shape)}, flow shape={list(flow.shape)}, is_distributed={is_distributed}")
         if is_distributed:
             ########################### split T frame offset ###########################
             if dist.get_rank() == 0:
@@ -1647,7 +1534,6 @@ class Decoder_flow(nn.Module):
         else:
             pframe = torch.cat((h[:, :, :1], h[:, :, :-1]), dim=2)
 
-        #print(f"[R{_rank}][VAE-DBG] alignlatent pframe: shape={list(pframe.shape)}, mean={pframe.float().mean().item():.6f}, flow: shape={list(flow.shape)}, mean={flow.float().mean().item():.6f}")
 
         if dist.get_rank() == 0:
             pframe = rearrange(pframe, "b c t h w -> (b t) c h w", t=t)
@@ -1661,7 +1547,6 @@ class Decoder_flow(nn.Module):
         # cloned_h = h.clone()
         # cloned_flow = flow.clone()
         h1, _ = self.align(pframe, flow)
-        #print(f"[R{_rank}][VAE-DBG] alignlatent after align: h1 shape={list(h1.shape)}, mean={h1.float().mean().item():.6f}, h shape={list(h.shape)}, mean={h.float().mean().item():.6f}")
 
         # print('dec_pframe_shape', h1.shape)
         if dist.get_rank() == 0:
@@ -1669,7 +1554,6 @@ class Decoder_flow(nn.Module):
         else:
             # b=1
             h1 = self.mergeip(torch.cat((h1, h[1:]), dim=1))
-        #print(f"[R{_rank}][VAE-DBG] alignlatent after mergeip: shape={list(h1.shape)}, mean={h1.float().mean().item():.6f}, min={h1.min().item():.6f}, max={h1.max().item():.6f}")
         return h1
 
     def get_p2p_groups(self):
@@ -1775,7 +1659,6 @@ class Decoder_flow(nn.Module):
                 h = torch.utils.checkpoint.checkpoint(self.pre_process, h, temb, use_reentrant=False)
         else:
             h = self.pre_process(h, temb)
-        #print(f"[R{_rank}][VAE-DBG] after pre_process: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
 
         # upsampling
         for i_level in reversed(range(1, self.num_resolutions)):
@@ -1846,10 +1729,8 @@ class Decoder_flow(nn.Module):
                 h = torch.utils.checkpoint.checkpoint(self.post_process, h, use_reentrant=False)
         else:
             h = self.post_process(h)
-        #print(f"[R{_rank}][VAE-DBG] after post_process: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
 
         h = rearrange(h, "(b t) c h w -> b c t h w", t=h.shape[0])
-        #print(f"[R{_rank}][VAE-DBG] after rearrange: shape={list(h.shape)}, dtype={h.dtype}, mean={h.float().mean().item():.6f}, min={h.min().item():.6f}, max={h.max().item():.6f}")
 
         return h, flow
 
@@ -1874,403 +1755,13 @@ class AutoencoderKL3D(nn.Module):
         self.image_key = image_key
         self.encoder = Encoder3D(**ddconfig, use_checkpoint=self.use_checkpoint)
         self.decoder = Decoder_flow(**ddconfig, use_checkpoint=self.use_checkpoint)
-        print(ignore_keys)
-        print('num_resize=', ddconfig["num_resize"])
-        # self.loss = instantiate_from_config(lossconfig)
         assert ddconfig["double_z"]
         self.quant_conv = torch.nn.Conv3d(2 * ddconfig["z_channels"], 2 * embed_dim, 1)
         self.post_quant_conv = torch.nn.Conv3d(embed_dim, ddconfig["z_channels"], 1)
         self.embed_dim = embed_dim
 
-        # tile
-        self.use_tiling = False
-        self.tile_sample_min_size = 256
-        self.tile_latent_min_size = int(self.tile_sample_min_size / (2 ** (len(ddconfig["ch_mult"]) - 1)))
-        self.tile_overlap_factor = 0.25
-        self.input_shape = None
-        if colorize_nlabels is not None:
-            assert type(colorize_nlabels) == int
-            self.register_buffer("colorize", torch.randn(3, colorize_nlabels, 1, 1))
-        if monitor is not None:
-            self.monitor = monitor
-        if ckpt_path is not None:
-            if inflation:
-                self.init_from_inflation(ckpt_path, mode=mode)
-            else:
-                self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
-        print('spynet_weight', self.encoder.flow_gen.basic_module[0].basic_module[1].conv.weight.abs().mean())
-
-    def init_from_ckpt(self, path, ignore_keys=list()):
-        sd = torch.load(path, map_location="cpu")
-        keys = list(sd.keys())
-        for k in keys:
-            for ik in ignore_keys:
-                # print('ik', ik)
-                if k.startswith(ik):
-                    print("Deleting key {} from state_dict.".format(k))
-                    del sd[k]
-        missing, unexpected = self.load_state_dict(sd, strict=False)
-        print(f"VAE-KL: Restored from {path} with {len(missing)} missing and {len(unexpected)} unexpected keys")
-        if len(missing) > 0:
-            print(f"Missing Keys: {missing}")
-            print(f"Unexpected Keys: {unexpected}")
-
-    def encode(self, x):
-        # tile
-        if self.use_tiling and (
-                x.shape[-1] > self.tile_sample_min_size
-                or x.shape[-2] > self.tile_sample_min_size
-        ):
-            return self.tiled_encode2d(x)
-        # total
-        h, flow = self.encoder(x)  # [1,3,41,480,720]
-        moments = self.quant_conv(h)
-        # posterior = DiagonalGaussianDistribution3D(moments)
-        return moments  # posterior, flow
-
     def decode(self, z, first_frame, is_distributed=False):
-        # tile
-        if self.use_tiling and (
-                z.shape[-1] > self.tile_latent_min_size
-                or z.shape[-2] > self.tile_latent_min_size
-        ):
-            return self.tiled_decode2d(z, first_frame=first_frame)
-        # total
-        # print(f"🔥 AutoencoderKL3D.decode INPUT: shape={list(z.shape)}, dtype={z.dtype}, mean={z.float().mean().item():.6f}, min={z.min().item():.6f}, max={z.max().item():.6f}, use_tiling={self.use_tiling}")
         z = self.post_quant_conv(z)
-        # print(f"🔥 After post_quant_conv: shape={list(z.shape)}, dtype={z.dtype}, mean={z.float().mean().item():.6f}, min={z.min().item():.6f}, max={z.max().item():.6f}")
         dec, flow = self.decoder(z, first_frame=first_frame, is_distributed=is_distributed)
-        # print(f"🔥 After Decoder_flow: shape={list(dec.shape)}, dtype={dec.dtype}, mean={dec.float().mean().item():.6f}, min={dec.min().item():.6f}, max={dec.max().item():.6f}")
         return dec
 
-    def pad_to_multiple_of(self, x, multiple=256):
-        height, width = x.shape[-2:]
-        pad_height = (multiple - height % multiple) % multiple
-        pad_width = (multiple - width % multiple) % multiple
-        padding = (0, pad_width, 0, pad_height)  # (left, right, top, bottom)
-        x = F.pad(x, padding, mode='constant', value=0)
-        return x
-
-    def forward(self, input, num_frames, sample_posterior=True, name=None):
-        # print('#####infer####')
-        self.input_shape = input.shape
-        if self.use_tiling:
-            input = self.pad_to_multiple_of(input)
-        posterior, flow_enc = self.encode(input)
-        # print('posterior size', posterior.shape)
-
-        first_frame = (num_frames % 2 == 1)
-        if sample_posterior:
-            z = posterior.sample()
-        else:
-            z = posterior.mode()
-        z = z.to(input.dtype)
-        dec = self.decode(z, first_frame=first_frame)
-        dec = dec[:, :, :, :self.input_shape[-2], :self.input_shape[-1]]
-        return dec, posterior
-
-    def get_input(self, batch, k):
-        x = batch[k]
-        if len(x.shape) == 3:
-            x = x[..., None]
-        x = x.permute(0, 3, 1, 2).to(memory_format=torch.contiguous_format).float()
-        return x
-
-    def training_step(self, batch, batch_idx, optimizer_idx):
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
-
-        if optimizer_idx == 0:
-            # train encoder+decoder+logvar
-            aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                            last_layer=self.get_last_layer(), split="train")
-            self.log("aeloss", aeloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_ae, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return aeloss
-
-        if optimizer_idx == 1:
-            # train the discriminator
-            discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, optimizer_idx, self.global_step,
-                                                last_layer=self.get_last_layer(), split="train")
-
-            self.log("discloss", discloss, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-            self.log_dict(log_dict_disc, prog_bar=False, logger=True, on_step=True, on_epoch=False)
-            return discloss
-
-    def validation_step(self, batch, batch_idx):
-        inputs = self.get_input(batch, self.image_key)
-        reconstructions, posterior = self(inputs)
-        aeloss, log_dict_ae = self.loss(inputs, reconstructions, posterior, 0, self.global_step,
-                                        last_layer=self.get_last_layer(), split="val")
-
-        discloss, log_dict_disc = self.loss(inputs, reconstructions, posterior, 1, self.global_step,
-                                            last_layer=self.get_last_layer(), split="val")
-
-        self.log("val/rec_loss", log_dict_ae["val/rec_loss"])
-        self.log_dict(log_dict_ae)
-        self.log_dict(log_dict_disc)
-        return self.log_dict
-
-    def configure_optimizers(self):
-        lr = self.learning_rate
-        opt_ae = torch.optim.Adam(list(self.encoder.parameters()) +
-                                  list(self.decoder.parameters()) +
-                                  list(self.quant_conv.parameters()) +
-                                  list(self.post_quant_conv.parameters()),
-                                  lr=lr, betas=(0.5, 0.9))
-        opt_disc = torch.optim.Adam(self.loss.discriminator.parameters(),
-                                    lr=lr, betas=(0.5, 0.9))
-        return [opt_ae, opt_disc], []
-
-    def get_last_layer(self):
-        return self.decoder.conv_out.weight
-
-    def blend_v(
-            self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[3], b.shape[3], blend_extent)
-        for y in range(blend_extent):
-            b[:, :, :, y, :] = a[:, :, :, -blend_extent + y, :] * (
-                    1 - y / blend_extent
-            ) + b[:, :, :, y, :] * (y / blend_extent)
-        return b
-
-    def blend_h(
-            self, a: torch.Tensor, b: torch.Tensor, blend_extent: int
-    ) -> torch.Tensor:
-        blend_extent = min(a.shape[4], b.shape[4], blend_extent)
-        for x in range(blend_extent):
-            b[:, :, :, :, x] = a[:, :, :, :, -blend_extent + x] * (
-                    1 - x / blend_extent
-            ) + b[:, :, :, :, x] * (x / blend_extent)
-        return b
-
-    def tiled_encode2d(self, x):
-        overlap_size = int(self.tile_sample_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_latent_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_latent_min_size - blend_extent
-
-        # Split the image into 512x512 tiles and encode them separately.
-        rows = []
-        flows = []
-        for i in range(0, x.shape[3], overlap_size):
-            row = []
-            flow = []
-            for j in range(0, x.shape[4], overlap_size):
-                tile = x[
-                       :,
-                       :,
-                       :,
-                       i: i + self.tile_sample_min_size,
-                       j: j + self.tile_sample_min_size,
-                       ]
-                tile, tile_flow = self.encoder(tile)
-                # print('enc_per_tile', tile.shape, tile_flow.shape)
-                tile = self.quant_conv(tile)
-                row.append(tile)
-                flow.append(tile_flow)
-
-            rows.append(row)
-            flows.append(flow)
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=4))
-
-        result_flows = []
-        for i, flow in enumerate(flows):
-            result_flow = []
-            for j, tile_flow in enumerate(flow):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile_flow = self.blend_v(flows[i - 1][j], tile_flow, blend_extent)
-                if j > 0:
-                    tile_flow = self.blend_h(flow[j - 1], tile_flow, blend_extent)
-                result_flow.append(tile_flow[:, :, :, :row_limit, :row_limit])
-            result_flows.append(torch.cat(result_flow, dim=4))
-
-        moments = torch.cat(result_rows, dim=3)
-        moments_flow = torch.cat(result_flows, dim=3)
-        posterior = DiagonalGaussianDistribution(moments)
-        # print('encoder size after tile', moments.shape, moments_flow.shape)
-
-        return posterior, moments_flow
-
-    def tiled_decode2d(self, z, first_frame):
-        overlap_size = int(self.tile_latent_min_size * (1 - self.tile_overlap_factor))
-        blend_extent = int(self.tile_sample_min_size * self.tile_overlap_factor)
-        row_limit = self.tile_sample_min_size - blend_extent
-
-        # Split z into overlapping 64x64 tiles and decode them separately.
-        # The tiles have an overlap to avoid seams between tiles.
-        rows = []
-        flows = []
-        for i in range(0, z.shape[3], overlap_size):
-            row = []
-            flow = []
-            for j in range(0, z.shape[4], overlap_size):
-                tile = z[
-                       :,
-                       :,
-                       :,
-                       i: i + self.tile_latent_min_size,
-                       j: j + self.tile_latent_min_size,
-                       ]
-                tile = self.post_quant_conv(tile)
-                decoded, dec_flow = self.decoder(tile, first_frame, is_distributed=True)
-                row.append(decoded)
-                flow.append(dec_flow)
-            rows.append(row)
-            flows.append(flow)
-        result_rows = []
-        for i, row in enumerate(rows):
-            result_row = []
-            for j, tile in enumerate(row):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile = self.blend_v(rows[i - 1][j], tile, blend_extent)
-                if j > 0:
-                    tile = self.blend_h(row[j - 1], tile, blend_extent)
-                result_row.append(tile[:, :, :, :row_limit, :row_limit])
-            result_rows.append(torch.cat(result_row, dim=4))
-        result_flows = []
-        for i, flow in enumerate(flows):
-            result_flow = []
-            for j, tile_flow in enumerate(flow):
-                # blend the above tile and the left tile
-                # to the current tile and add the current tile to the result row
-                if i > 0:
-                    tile_flow = self.blend_v(flows[i - 1][j], tile_flow, blend_extent)
-                if j > 0:
-                    tile_flow = self.blend_h(flow[j - 1], tile_flow, blend_extent)
-                result_flow.append(tile_flow[:, :, :, :row_limit, :row_limit])
-            result_flows.append(torch.cat(result_flow, dim=4))
-
-        dec = torch.cat(result_rows, dim=3)
-        dec_flows = torch.cat(result_flows, dim=3)
-        return dec, dec_flows
-
-    def enable_tiling(self, use_tiling: bool = True):
-        self.use_tiling = use_tiling
-
-    def disable_tiling(self):
-        self.enable_tiling(False)
-
-    @torch.no_grad()
-    def log_images(self, batch, only_inputs=False, **kwargs):
-        log = dict()
-        x = self.get_input(batch, self.image_key)
-        x = x.to(self.device)
-        if not only_inputs:
-            xrec, posterior = self(x)
-            if x.shape[1] > 3:
-                # colorize with random projection
-                assert xrec.shape[1] > 3
-                x = self.to_rgb(x)
-                xrec = self.to_rgb(xrec)
-            log["samples"] = self.decode(torch.randn_like(posterior.sample()))
-            log["reconstructions"] = xrec
-        log["inputs"] = x
-        return log
-
-    def init_from_inflation(self, path, mode='repeat'):
-        def translate_key(key):
-            item = key.split('.')
-            if 'mid' in key:
-                return item[0] + '.mid.block_2.conv2.' + item[-1]
-            else:
-                return '.'.join(item[:3]) + '.block.1.conv2.' + item[-1]
-
-        sd = torch.load(path, map_location="cpu")
-
-        non_inflation_keys = [k for k, v in self.state_dict().items() if len(v.size()) != 5 and k in sd]
-        inflation_keys = [k for k, v in self.state_dict().items() if len(v.size()) == 5 and k in sd]
-        non_inflation_sd = {k: (sd[k] if k in sd else sd[translate_key(k)]) for k in non_inflation_keys}
-        inflation_sd = {k: (sd[k] if k in sd else sd[translate_key(k)]) for k in inflation_keys}
-
-        # for k, v in non_inflation_sd.items():
-        #     print(k, v.size(), len(v.size()))
-        # for k, v in inflation_sd.items():
-        #     print('inflation', k, v.size(), len(v.size()))
-
-        missing_keys, unexpected_keys = self.load_state_dict(non_inflation_sd, strict=False)
-        print(f'missing_keys: {missing_keys}, unexpected: {unexpected_keys}')
-        conv_layer_name = []
-        inflation_layer = []
-        no_inflation_conv = []
-        qkv = []
-        others = []
-        for name, p in self.named_parameters():
-            if name in inflation_keys:
-                # print(name, p.mean())
-                t_size = p.data.size()[2]
-                if mode == 'repeat':
-                    for i in range(t_size):
-                        p.data[:, :, i, :, :] = inflation_sd[name].data / t_size
-                elif mode == 'last_slice':
-                    for i in range(t_size):
-                        p.data[:, :, i, :, :] = inflation_sd[name].data * 0.0
-                    p.data[:, :, -1, :, :] = inflation_sd[name].data
-        print('Succeed to INFLATION!!!!!!!!!!!!')
-
-    def to_rgb(self, x):
-        assert self.image_key == "segmentation"
-        if not hasattr(self, "colorize"):
-            self.register_buffer("colorize", torch.randn(3, x.shape[1], 1, 1).to(x))
-        x = F.conv2d(x, weight=self.colorize)
-        x = 2. * (x - x.min()) / (x.max() - x.min()) - 1.
-        return x
-
-
-class IdentityFirstStage(nn.Module):
-    def __init__(self, *args, vq_interface=False, **kwargs):
-        self.vq_interface = vq_interface  # TODO: Should be true by default but check to not break older stuff
-        super().__init__()
-
-    def encode(self, x, *args, **kwargs):
-        return x
-
-    def decode(self, x, *args, **kwargs):
-        return x
-
-    def quantize(self, x, *args, **kwargs):
-        if self.vq_interface:
-            return x, None, [None, None, None]
-        return x
-
-    def forward(self, x, *args, **kwargs):
-        return x
-
-
-if __name__ == '__main__':
-    # import sys
-    # sys.path.append('/home/weikanggong/MGM/mimo/')
-
-    ddconfig = {'double_z': False,
-                'z_channels': 8,
-                'resolution': 256,
-                'in_channels': 3,
-                'out_ch': 3,
-                'ch_mult': [1, 1, 2, 2, 4],
-                'num_res_blocks': 2,
-                'attn_resolutions': [16],
-                'dropout': 0.0,
-                'ch': 128}
-    lossconfig = {'target': 'torch.nn.Identity'}
-    model = VQModelInterface(embed_dim=8, n_embed=16384, ddconfig=ddconfig, lossconfig=lossconfig)
-
-    out = model.encode(torch.randn(10, 3, 256, 256))
-    print(out.shape)
-    print(out)
-    # for n,p in model.named_parameters():
-    #     print(n)

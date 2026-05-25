@@ -1,5 +1,4 @@
 import os
-import sys
 os.environ["COMBINED_ENABLE"] = "1"
 
 os.environ["INF_NAN_MODE_ENABLE"] = "1"
@@ -13,8 +12,6 @@ except:
     print("no torch_npu")
 
 import copy
-import random
-import numpy as np
 import time
 import json
 import torch.distributed as dist
@@ -26,19 +23,6 @@ except:
 
 from vllm_omni.diffusion.models.mgm_video.vae.vae_utils import instantiate_from_config, read_from_yaml, merge_args
 from vllm_omni.diffusion.models.mgm_video.vae.vae_distributed_modules import SyncGroupNormWithGather, SyncGroupNormWithSyncBN, DistributedConv3D, DistributedConv2D
-# Stubs for mimogpt.engine.utils (not needed for decode, but imported at module level)
-def get_state_dict(*a, **kw):
-    return {}
-def parse_args_from_yaml(*a, **kw):
-    import argparse; return argparse.Namespace()
-
-try:
-    import moxing as mox
-except:
-    print("no moxing")
-from vllm_omni.diffusion.models.mgm_video.vae.vae_utils import read_from_yaml, merge_args
-
-calculate_metric = None
 
 
 def print_by_rank(content, output_path=None):
@@ -52,14 +36,6 @@ def print_by_rank(content, output_path=None):
                 f.write(str(content))
                 f.write("\n")
         print(content)
-
-
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
 
 def set_distributed_config(model, args, keys, conv3d_pad_config):
@@ -562,8 +538,6 @@ class DistributedVAE(torch.nn.Module):
         self.model = instantiate_from_config(config.model_config)
         self.out_channels = self.model.embed_dim
 
-        self.model.disable_tiling()
-
         if args.infer_config.deterministic:
             print_by_rank("use_deterministic...")
             torch.use_deterministic_algorithms(True)
@@ -621,34 +595,15 @@ class DistributedVAE(torch.nn.Module):
 
         self.args = args
 
-    def encode(self, x):
-        with torch.no_grad():
-            if x.shape[2] > 1:
-                x = pad_split_frames(x, self.args)
-            enc = self.model.encode(x)
-            if isinstance(enc, tuple):
-                enc = enc[0]
-        if not isinstance(enc, torch.Tensor):
-            enc = enc.sample()
-        if x.shape[2] > 1:
-            return gather_video(enc, self.args, "split_h")
-        else:
-            return enc.unsqueeze(0)
-
     def decode(self, x):
         with torch.no_grad():
-            #print(f"🔥 DistributedVAE.decode INPUT: shape={list(x.shape)}, dtype={x.dtype}, mean={x.float().mean().item():.6f}, min={x.min().item():.6f}, max={x.max().item():.6f}")
             if self.decode_pad > 0:
                 x = torch.nn.functional.pad(x, (0, 0, 0, 0, 0, self.decode_pad), mode="constant", value=0)
             x = pad_split_frames(x, self.args, "split_h")
-            #print(f"🔥 After pad_split_frames: shape={list(x.shape)}, dtype={x.dtype}, mean={x.float().mean().item():.6f}")
             dec = self.model.decode(x, first_frame=self.args.max_frame % 2 == 1, is_distributed=True)
             if isinstance(dec, tuple):
                 dec = dec[0]
-            #print(f"🔥 After model.decode (before gather): shape={list(dec.shape)}, dtype={dec.dtype}, mean={dec.float().mean().item():.6f}, min={dec.min().item():.6f}, max={dec.max().item():.6f}")
             dec = gather_video(dec.contiguous(), self.args)[0]
-            #print(f"🔥 After gather_video: shape={list(dec.shape)}, dtype={dec.dtype}, mean={dec.float().mean().item():.6f}, min={dec.min().item():.6f}, max={dec.max().item():.6f}")
             result = dec[:,:,:dec.shape[2]-self.decode_pad*self.patch_size[0]]
-            #print(f"🔥 DistributedVAE.decode OUTPUT: shape={list(result.shape)}, dtype={result.dtype}, mean={result.float().mean().item():.6f}, min={result.min().item():.6f}, max={result.max().item():.6f}")
             return result
 

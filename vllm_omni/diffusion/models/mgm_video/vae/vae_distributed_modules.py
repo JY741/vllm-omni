@@ -11,7 +11,6 @@ This module merges:
 """
 
 import os
-import argparse
 import json
 import collections
 import copy
@@ -352,65 +351,6 @@ class SyncGroupNormWithSyncBN(nn.Module):
                 self.split_infer
             )
         return x
-
-def dump_tensor(x, name, split_type="split_h", is_distributed=True, is_gather=True):
-    dump_path = "dumps"
-    os.makedirs(dump_path, exist_ok=True)
-    if dist.get_world_size() == 1:
-        name = "one_card_"+name
-        torch.save(x, os.path.join(dump_path, "{}.pth".format(name)))
-    elif not is_distributed:
-        if is_gather:
-            name = "distributed_"+name
-        else:
-            name = "one_card_"+name
-        print("save..........................................", name)
-        torch.save(x, os.path.join(dump_path, "{}.pth".format(name)))
-    elif len(x.shape) == 3:  # gather sequence
-        tensor_list = [torch.zeros(x.shape, device=torch.cuda.current_device(), dtype=x.dtype) for _ in range(dist.get_world_size())]
-        x = x.contiguous()
-        dist.all_gather(tensor_list, x)
-        x = torch.cat(tensor_list, dim=1).cpu()
-        name = "distributed_"+name
-        torch.save(x, os.path.join(dump_path, "{}.pth".format(name)))
-    else:
-        def slice_tensor(tensor_list, all_shapes, axis):
-            for idx, shape in enumerate(all_shapes):
-                if split_type == "split_h":
-                    tensor_list[idx] = tensor_list[idx][:, :, :, :shape[axis], :]
-                elif split_type == "split_w":
-                    tensor_list[idx] = tensor_list[idx][:, :, :, :, :shape[axis]]
-                elif split_type == "split_t":
-                    tensor_list[idx] = tensor_list[idx][:, :, :shape[axis], :, :]
-            return tensor_list
-
-        all_shapes = [torch.zeros([5], device=torch.cuda.current_device(), dtype=torch.int32) for _ in range(dist.get_world_size())]
-        shape_tensor = torch.tensor(x.shape, device=torch.cuda.current_device(), dtype=torch.int32)
-        dist.all_gather(all_shapes, shape_tensor)
-        gather_axis = {
-            "split_h": [3, 3],
-            "split_w": [4, 1],
-            "split_t": [2, 5],
-        }
-
-        axis = gather_axis[split_type][0]
-        max_axis_val = max([i[axis] for i in all_shapes])
-        padding_info = [0,0,0,0,0,0]
-
-        padding_info[gather_axis[split_type][1]] = max_axis_val-x.shape[axis]
-        padding_info = tuple(padding_info)
-        b, c, t, h, w = x.shape
-        if max_axis_val - x.shape[axis] > 0:
-            x = torch.nn.functional.pad(x, padding_info, mode="constant", value=0)
-
-        tensor_list = [torch.zeros(x.shape, device=torch.cuda.current_device(), dtype=x.dtype) for _ in range(dist.get_world_size())]
-        x = x.contiguous()
-        dist.all_gather(tensor_list, x)
-        tensor_list = slice_tensor(tensor_list, all_shapes, axis)
-        x = torch.cat(tensor_list, dim=axis).cpu()
-        name = "distributed_"+name
-        torch.save(x, os.path.join(dump_path, "{}.pth".format(name)))
-
 
 class SyncGroupNormWithGather(nn.Module):
     def __init__(self, in_channels, batch_size=1, groups=32):
