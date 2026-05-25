@@ -11,6 +11,7 @@ from typing import Tuple
 from torch.nn import functional as F
 from torch.profiler import record_function
 from einops import rearrange, repeat
+from vllm.model_executor.layers.linear import ReplicatedLinear
 
 from .mmdit_parallel_states import get_context_parallel_group
 from .mmdit_communications import all_to_all, split_forward_gather_backward, gather_forward_split_backward
@@ -275,8 +276,8 @@ class CaptionEmbedder(nn.Module):
 class MLP(nn.Module):
     def __init__(self, n_embd, dropout=0.0):
         super().__init__()
-        self.dense_h_to_4h = nn.Linear(n_embd, 4 * n_embd)
-        self.dense_4h_to_h = nn.Linear(4 * n_embd, n_embd)
+        self.dense_h_to_4h = ReplicatedLinear(n_embd, 4 * n_embd, bias=True, return_bias=False)
+        self.dense_4h_to_h = ReplicatedLinear(4 * n_embd, n_embd, bias=True, return_bias=False)
         self.dropout = nn.Dropout(dropout)
         self.gelu = nn.GELU()
 
@@ -299,10 +300,10 @@ class JoinAttention(nn.Module):
         self.use_3d_rope = use_3d_rope
         self.use_rmsnorm = use_rmsnorm
         self.use_qknorm = use_qknorm
-        self.qkv_x = nn.Linear(n_embd, 3 * n_embd)
-        self.qkv_y = nn.Linear(n_embd, 3 * n_embd)
-        self.proj_x = nn.Linear(n_embd, n_embd)
-        self.proj_y = nn.Linear(n_embd, n_embd)
+        self.qkv_x = ReplicatedLinear(n_embd, 3 * n_embd, bias=True, return_bias=False)
+        self.qkv_y = ReplicatedLinear(n_embd, 3 * n_embd, bias=True, return_bias=False)
+        self.proj_x = ReplicatedLinear(n_embd, n_embd, bias=True, return_bias=False)
+        self.proj_y = ReplicatedLinear(n_embd, n_embd, bias=True, return_bias=False)
         self.attn_drop = nn.Dropout(dropout)
         self.proj_drop_x = nn.Dropout(dropout)
         self.proj_drop_y = nn.Dropout(dropout)
