@@ -452,6 +452,7 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
         """Generate video from text prompt.
 
         Args:
+
             req: The diffusion request
             prompt: Text prompt (overridden by req.prompts)
             negative_prompt: Negative prompt
@@ -470,6 +471,7 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
             DiffusionOutput containing the generated video
         """
         # Parse request parameters
+        self._setup_offload_if_needed()
         if len(req.prompts) > 1:
             raise ValueError("MGM-Video only supports a single prompt per request.")
         if len(req.prompts) == 1:
@@ -758,38 +760,32 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
         loader = AutoWeightsLoader(self, skip_prefixes=["text_encoder.", "vae."])
         result = loader.load_weights(remapped_weights)
 
-        # After weights are loaded, enable DiT inference offload (original repo
-        # approach: scheduler=1 loads all weights on first timestep, offloads on
-        # last). We skip vllm-omni's LayerWiseOffloadBackend for this pipeline
-        # since enable_dit_inference_offload manages CPU<->device transfers
-        # directly via forward hooks, matching the original MGM-Video-Ascend repo.
-        if getattr(self, "_enable_layerwise_offload", False):
-            num_steps = getattr(self, "_num_inference_steps", 9)
-            if hasattr(self.transformer, "enable_dit_inference_offload"):
-                # The original repo loads the full model to device first, then
-                # enable_dit_inference_offload copies blocks 1..N weights to
-                # pinned CPU memory and resizes their device storage to 0.
-                # Block 0 stays on device. Since load_device="cpu" when
-                # layerwise offload is enabled, we must move the entire
-                # transformer to device before calling enable_dit_inference_offload.
-                logger.info("Moving transformer to %s before enable_dit_inference_offload", self.device)
-                self.transformer.to(self.device)
-
-                logger.info("Enabling DiT inference offload (scheduler=1, num_steps=%d)", num_steps)
-                self.transformer.enable_dit_inference_offload(
-                    offload_scheduler=1, num_sampling_steps=num_steps
-                )
-
-        # VAE decode warm-up: run a tiny decode to pre-allocate NPU memory
-        # for VAE intermediate tensors. Without this, the first real request
-        # suffers ~30s cold-start latency because the NPU memory pool has
-        # never allocated space for VAE feature maps and must request new
-        # segments from the OS (very slow on NPU). The original repo avoids
-        # this because VAE is moved to device at init time and the memory
-        # pool is already warm.
-        # self._warmup_vae_decode()
+        # Defer offload setup to first forward() call. We cannot do it here
+        # because the framework calls _process_weights_after_loading() after
+        # load_weights() returns. That method iterates all modules and calls
+        # module.to(target_device) on those with quant_method (including
+        # ReplicatedLinear's UnquantizedLinearMethod). If we already moved
+        # the transformer to NPU and cleared storage via
+        # enable_dit_inference_offload, the .to(cpu) would hit a null pointer.
+        self._need_offload_setup = getattr(self, "_enable_layerwise_offload", False)
 
         return result
+
+    def _setup_offload_if_needed(self):
+        """Lazily set up DiT inference offload on first forward call."""
+        if not getattr(self, "_need_offload_setup", False):
+            return
+        self._need_offload_setup = False
+
+        num_steps = getattr(self, "_num_inference_steps", 9)
+        if hasattr(self.transformer, "enable_dit_inference_offload"):
+            logger.info("Moving transformer to %s before enable_dit_inference_offload", self.device)
+            self.transformer.to(self.device)
+
+            logger.info("Enabling DiT inference offload (scheduler=1, num_steps=%d)", num_steps)
+            self.transformer.enable_dit_inference_offload(
+                offload_scheduler=1, num_sampling_steps=num_steps
+            )
 
     def _warmup_vae_decode(self) -> None:
         """Warm-up VAE decode to pre-allocate NPU memory for intermediate tensors.
