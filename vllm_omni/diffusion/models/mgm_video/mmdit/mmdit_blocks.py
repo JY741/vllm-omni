@@ -13,8 +13,7 @@ from torch.profiler import record_function
 from einops import rearrange, repeat
 from vllm.model_executor.layers.linear import ReplicatedLinear
 
-from .mmdit_parallel_states import get_context_parallel_group
-from .mmdit_communications import all_to_all, split_forward_gather_backward, gather_forward_split_backward
+from .mmdit_utils import get_context_parallel_group, all_to_all, split_forward_gather_backward, gather_forward_split_backward
 
 import importlib
 

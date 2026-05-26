@@ -272,11 +272,11 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
                     if world_size > 1:
                         cp_size = world_size
                         # Initialize CP group using original repo's parallel_states
-                        from vllm_omni.diffusion.models.mgm_video.mmdit.mmdit_parallel_states import (
+                        from vllm_omni.diffusion.models.mgm_video.mmdit.mmdit_utils import (
                             initialize_distributed,
                         )
                         initialize_distributed(context_parallel_size=cp_size)
-                        logger.info("CP enabled: cp_size=%d (initialized via mmdit_parallel_states)", cp_size)
+                        logger.info("CP enabled: cp_size=%d (initialized via mmdit_utils)", cp_size)
             except Exception:
                 logger.warning("CP requested but DIT group not initialized, falling back to cp_size=1")
                 cp_size = 1

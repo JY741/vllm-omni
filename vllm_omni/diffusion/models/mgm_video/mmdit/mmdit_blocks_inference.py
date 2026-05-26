@@ -17,7 +17,7 @@ import torch.distributed as dist
 from typing import Tuple
 from torch.nn import functional as F
 from einops import rearrange, repeat
-from .mmdit_communications import all_to_all
+from .mmdit_utils import all_to_all
 from .mmdit_blocks import JoinAttention
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
 

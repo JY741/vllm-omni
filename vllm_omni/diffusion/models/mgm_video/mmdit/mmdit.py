@@ -9,11 +9,11 @@ import torch.nn.functional as F
 from torch.profiler import record_function
 from timm.models.vision_transformer import Mlp
 from einops import rearrange, repeat
-from .mmdit_functional import to_2tuple
+from .mmdit_utils import to_2tuple
 from .mmdit_blocks import t2i_modulate, modulate, CaptionEmbedder, \
     TimestepEmbedder, FinalLayer, MLP, create_sinusoidal_positions, JoinAttention, SizeEmbedder
-from .mmdit_parallel_states import get_context_parallel_group
-from .mmdit_communications import (
+from .mmdit_utils import (
+    get_context_parallel_group,
     gather_forward_split_backward,
     split_forward_gather_backward,
 )

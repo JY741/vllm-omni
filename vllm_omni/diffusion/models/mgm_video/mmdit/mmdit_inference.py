@@ -27,7 +27,7 @@ except ImportError:
 
 from .mmdit import MMDiTBlock, MMDiT
 from .mmdit_blocks_inference import JoinAttentionInference
-from .mmdit_cache_utils import read_2d_array_from_file_int
+from .mmdit_utils import read_2d_array_from_file_int
 
 # ---------------------------------------------------------------------------
 # NPU / CUDA stream & event helpers
