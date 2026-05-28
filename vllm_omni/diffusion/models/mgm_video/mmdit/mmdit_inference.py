@@ -191,17 +191,22 @@ class MMDiTInference(MMDiT):
 
     @staticmethod
     def _convert_spatial_freq_for_inference(spatial_freq):
-        """Convert legacy spatial_freq format to (cos, sin) tuples for RotaryEmbedding.
+        """Pre-shape cos/sin once per step into mindiesd input format [1, S, 1, D].
 
-        Legacy format per axis: [S, 2*dim] where [:, :dim] is sin (interleaved), [:, dim:] is cos (interleaved).
-        Target format per axis: (cos[S, dim/2], sin[S, dim/2]) — non-interleaved half-dim.
+        Input  sincos: [S, 2D] = sin([S, D]) || cos([S, D]), already interleaved-replicated
+                       by create_sinusoidal_positions (stack+flatten).
+        Output per axis: (cos[1, S, 1, D], sin[1, S, 1, D]) — ready for direct mindiesd
+                         rotary_position_embedding call, skipping the RotaryEmbedding
+                         wrapper's expand+reshape D2D copy.
         """
         result = []
         for sincos in spatial_freq:
             dim = sincos.shape[-1] // 2
-            sin_interleaved = sincos[:, :dim]
-            cos_interleaved = sincos[:, dim:]
-            result.append((cos_interleaved[:, ::2].contiguous(), sin_interleaved[:, ::2].contiguous()))
+            sin = sincos[:, :dim].contiguous()
+            cos = sincos[:, dim:].contiguous()
+            sin = sin.unsqueeze(0).unsqueeze(2)
+            cos = cos.unsqueeze(0).unsqueeze(2)
+            result.append((cos, sin))
         return result
 
     def blocks_forward(self, x, y, t, x_padding_size, y_padding_size, mask, spatial_freq, fn, base_size_h, base_size_w, **kwargs):

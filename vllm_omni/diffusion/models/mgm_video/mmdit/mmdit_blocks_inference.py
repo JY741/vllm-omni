@@ -14,6 +14,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
+from importlib.util import find_spec
 from typing import Tuple
 from torch.nn import functional as F
 from einops import rearrange, repeat
@@ -32,6 +33,13 @@ try:
 except Exception as e:
     print("no mindiesd !!!")
 
+_MINDIESD_ROPE = None
+if find_spec("mindiesd") is not None:
+    try:
+        from mindiesd import rotary_position_embedding as _MINDIESD_ROPE
+    except Exception:
+        _MINDIESD_ROPE = None
+
 
 class JoinAttentionInference(JoinAttention):
     def __init__(self, n_embd, n_head, dropout=0.0, fa_keep_prob=1.0, use_3d_rope=True, use_qknorm=True,
@@ -43,6 +51,7 @@ class JoinAttentionInference(JoinAttention):
         )
         self.laser_atten = laser_atten
         self.rope = RotaryEmbedding(is_neox_style=False)
+        self._mindiesd_rope = _MINDIESD_ROPE
 
     def la(self, query, key, value):
         query = query.transpose(1,2)
@@ -89,29 +98,45 @@ class JoinAttentionInference(JoinAttention):
         return out
 
     def _apply_3d_rope(self, q, k, spatial_freq):
-        """Apply 3D RoPE using vllm-omni RotaryEmbedding.
+        """Apply 3D RoPE.
 
         Args:
             q, k: [B, S, N, D] (BSND layout)
             spatial_freq: [(cos_h, sin_h), (cos_w, sin_w), (cos_t, sin_t)]
-                each cos/sin: [S, dim/2]
+                fast path (mindiesd available): each cos/sin is [1, S, 1, D_seg], fully interleaved.
+                fallback path: cos/sin are [1, S, 1, D_seg], will be sliced back to [S, D_seg/2].
         Returns:
             q, k: [B, S, N, D] with RoPE applied
         """
         (cos_h, sin_h), (cos_w, sin_w), (cos_t, sin_t) = spatial_freq
-        dim_h = cos_h.shape[-1] * 2
-        dim_w = cos_w.shape[-1] * 2
-        dim_t = cos_t.shape[-1] * 2
+        dim_h = cos_h.shape[-1]
+        dim_w = cos_w.shape[-1]
+        dim_t = cos_t.shape[-1]
 
         q_h, q_w, q_t = q.split([dim_h, dim_w, dim_t], dim=-1)
         k_h, k_w, k_t = k.split([dim_h, dim_w, dim_t], dim=-1)
 
-        q_h = self.rope(q_h, cos_h, sin_h)
-        k_h = self.rope(k_h, cos_h, sin_h)
-        q_w = self.rope(q_w, cos_w, sin_w)
-        k_w = self.rope(k_w, cos_w, sin_w)
-        q_t = self.rope(q_t, cos_t, sin_t)
-        k_t = self.rope(k_t, cos_t, sin_t)
+        if self._mindiesd_rope is not None:
+            rope = self._mindiesd_rope
+            q_h = rope(q_h, cos_h, sin_h, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            k_h = rope(k_h, cos_h, sin_h, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            q_w = rope(q_w, cos_w, sin_w, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            k_w = rope(k_w, cos_w, sin_w, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            q_t = rope(q_t, cos_t, sin_t, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+            k_t = rope(k_t, cos_t, sin_t, rotated_mode="rotated_interleaved", head_first=False, fused=True)
+        else:
+            cos_h_half = cos_h[0, :, 0, ::2].contiguous()
+            sin_h_half = sin_h[0, :, 0, ::2].contiguous()
+            cos_w_half = cos_w[0, :, 0, ::2].contiguous()
+            sin_w_half = sin_w[0, :, 0, ::2].contiguous()
+            cos_t_half = cos_t[0, :, 0, ::2].contiguous()
+            sin_t_half = sin_t[0, :, 0, ::2].contiguous()
+            q_h = self.rope(q_h, cos_h_half, sin_h_half)
+            k_h = self.rope(k_h, cos_h_half, sin_h_half)
+            q_w = self.rope(q_w, cos_w_half, sin_w_half)
+            k_w = self.rope(k_w, cos_w_half, sin_w_half)
+            q_t = self.rope(q_t, cos_t_half, sin_t_half)
+            k_t = self.rope(k_t, cos_t_half, sin_t_half)
 
         q = torch.cat([q_h, q_w, q_t], dim=-1)
         k = torch.cat([k_h, k_w, k_t], dim=-1)
