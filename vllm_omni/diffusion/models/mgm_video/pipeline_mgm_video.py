@@ -410,28 +410,6 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
         return current_model(x=x, timestep=timestep, y=y, y_mask=y_mask,
                              cur_time_index=cur_time_index, **kwargs)
 
-    def _offload_transformer(self) -> bool:
-        """Release transformer NPU memory after DiT inference.
-
-        The original MGM-Video repo uses enable_dit_inference_offload()
-        with scheduler=1, which offloads all weights to CPU at the last
-        denoising step. We just need to empty_cache() here since the
-        offload hooks handle the weight movement.
-
-        Returns:
-            True if offload was performed, False otherwise.
-        """
-        # Release freed memory back to the allocator
-        try:
-            if hasattr(torch, "npu") and torch.npu.is_available():
-                torch.npu.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except RuntimeError:
-            pass
-
-        return True
-
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -564,10 +542,6 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
             generator=generator,
             latents=req.sampling_params.latents,
         )
-        # # 打印 prepare_latents 输出的 latents 张量信息
-        # print(f"vLLM latents shape      : {latents.shape}")
-        # print(f"vLLM latents mean       : {latents.float().mean().item():.8f}")
-        # print(f"vLLM latents min/max    : {latents.float().min().item():.8f} / {latents.float().max().item():.8f}")
 
         if attention_kwargs is None:
             attention_kwargs = {}
@@ -589,17 +563,6 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
                     latent_model_input = latents
                     timestep = t.expand(latents.shape[0])
                     
-                    # ====================== vLLM 排查打印（和原仓完全对齐） ======================
-                    # print(f"\n==================== vLLM STEP {t.item():.4f} ====================")
-                    # print(f"vLLM x shape      : {latent_model_input.shape}")
-                    # print(f"vLLM x mean       : {latent_model_input.float().mean().item():.8f}")
-                    # print(f"vLLM x min/max    : {latent_model_input.float().min().item():.8f} / {latent_model_input.float().max().item():.8f}")
-                    # print(f"vLLM y shape      : {prompt_embeds.shape}")
-                    # print(f"vLLM y mean       : {prompt_embeds.float().mean().item():.8f}")
-                    # if y_mask is not None:
-                    #     print(f"vLLM y_mask       : {y_mask.shape}, mean: {y_mask.float().mean().item():.4f}")
-                    # ============================================================================
-
                     do_true_cfg = guidance_scale > 1.0 and negative_prompt_embeds is not None
 
                     # Prepare kwargs for positive prediction
@@ -630,14 +593,6 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
                         negative_kwargs=negative_kwargs,
                         cfg_normalize=False,
                     )
-                    
-                    
-                    # ====================== vLLM noise_pred 打印 ======================
-                    # print(f"vLLM noise_pred shape : {noise_pred.shape}")
-                    # print(f"vLLM noise_pred mean  : {noise_pred.float().mean().item():.8f}")
-                    # print(f"vLLM noise_pred min/max: {noise_pred.float().min().item():.8f} / {noise_pred.float().max().item():.8f}")
-                    # print("="*70 + "\n")
-                    # ==================================================================
 
                     # Scheduler step
                     latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
@@ -646,14 +601,14 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
         mmdit_time_end = time.time()
         print(f"mmdit cost time={mmdit_time_end - mmdit_time_start}")
 
-        # Clear cache before VAE decode
-        try:
-            if hasattr(torch, "npu") and torch.npu.is_available():
-                torch.npu.empty_cache()
-            elif torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except RuntimeError:
-            pass
+        # NOTE: No empty_cache() between denoise and VAE decode.
+        # Under expandable_segments (PYTORCH_NPU_ALLOC_CONF=expandable_segments:True),
+        # the ~21GB of transformer weights freed via resize_(0) at the last
+        # denoising step stay as reusable free space inside one contiguous
+        # virtual segment. VAE decode reuses that space directly, so returning
+        # it to the driver here only adds a multi-second unmap on the critical
+        # path (and forces a re-map on the next request) without lowering the
+        # VAE-stage memory peak. Keep it cached.
         self._current_timestep = None
 
         # Apply per-frame scale/bias normalization before VAE decode
@@ -671,42 +626,10 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
             latents_fp32 = latents_fp32 / frame_scale[None, None, :, None, None] + frame_bias[None, None, :, None, None]
             latents = latents_fp32.to(latents.dtype)
 
-
-        # ====================== 对比打印 ======================
-        # print("========== vLLM FINAL LATENT ==========")
-        # print("shape:", latents.shape)
-        # print("mean:", latents.mean().item())
-        # print("min:", latents.min().item())
-        # print("max:", latents.max().item())
-
-        # ====================== Cross-repo VAE decode debug ======================
-        # If /tmp/mgm_original_latent.pt exists, load it and replace latents
-        # before VAE decode. This isolates VAE decode differences from DiT
-        # inference differences. The saved tensor is the pre-frame_scale latent
-        # from the original MGM-Video-Ascend repo.
-        # _latent_override_path = "/tmp/mgm_original_latent.pt"
-        # if os.path.exists(_latent_override_path):
-        #     override_latent = torch.load(_latent_override_path, map_location=latents.device, weights_only=True)
-        #     # The original saves with shape [1, 16, T, H, W] in bfloat16
-        #     override_latent = override_latent.to(latents.dtype)
-        #     print(f"🔥 LOADED original latent from {_latent_override_path}: "
-        #           f"shape={list(override_latent.shape)}, dtype={override_latent.dtype}, "
-        #           f"mean={override_latent.float().mean().item():.6f}, "
-        #           f"min={override_latent.min().item():.6f}, max={override_latent.max().item():.6f}")
-        #     print(f"🔥 REPLACING vllm-omni latent (mean={latents.float().mean().item():.6f}) "
-        #           f"with original latent (mean={override_latent.float().mean().item():.6f})")
-        #     latents = override_latent
-
         # VAE decode
         if output_type == "latent":
             output = latents
         else:
-            # Release transformer NPU memory before VAE decode.
-            # The original repo's enable_dit_inference_offload() with
-            # scheduler=1 offloads weights to CPU at the last denoising step.
-            # Just empty_cache() to release any remaining device memory.
-            self._offload_transformer()
-
             # Lazy move VAE to device (kept on CPU during init to save memory,
             # but stays on device after first move — matching the original repo
             # where VAE is never offloaded back to CPU).
@@ -786,42 +709,6 @@ class MGMVideoPipeline(nn.Module, CFGParallelMixin, ProgressBarMixin, DiffusionP
             self.transformer.enable_dit_inference_offload(
                 offload_scheduler=1, num_sampling_steps=num_steps
             )
-
-    def _warmup_vae_decode(self) -> None:
-        """Warm-up VAE decode to pre-allocate NPU memory for intermediate tensors.
-
-        The first VAE decode call is ~30s slower than subsequent calls because
-        the NPU memory pool must allocate new segments from the OS for VAE
-        feature maps. By running a decode at init time, we ensure the memory
-        pool is warm before the first real request arrives.
-        """
-        try:
-            # Move VAE to device if still on CPU (lazy init)
-            if self.vae.device.type == "cpu":
-                self.vae = self.vae.to(self.device)
-
-            # Use a latent with the same spatial resolution as real requests
-            # to ensure the NPU memory pool allocates segments large enough
-            # for actual VAE feature maps. Shape: [1, 16, 4, H/8, W/8].
-            # 4 latent frames = 32 output frames (patch_size=8), enough to
-            # exercise all VAE decoder layers including Conv3D ops.
-            warmup_latent = torch.randn(
-                1, 16, 4, 90, 160,
-                device=self.device,
-                dtype=self.vae.dtype,
-            )
-            logger.info("Running VAE decode warm-up to pre-allocate NPU memory...")
-            with torch.no_grad():
-                _ = self.vae.decode(warmup_latent, return_dict=False, num_frames=32)
-            # Release warm-up tensors. Do NOT call empty_cache() here —
-            # we want the NPU memory pool to retain the expanded segments
-            # so the first real request can reuse them without OS-level
-            # allocation. empty_cache() would shrink segments back and
-            # defeat the purpose of the warm-up.
-            del warmup_latent, _
-            logger.info("VAE decode warm-up complete.")
-        except Exception as e:
-            logger.warning("VAE decode warm-up failed (non-fatal): %s", e)
 
 
 class RectifiedFlowScheduler:
