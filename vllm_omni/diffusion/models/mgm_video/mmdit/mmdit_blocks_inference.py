@@ -296,6 +296,22 @@ class JoinAttentionInference(JoinAttention):
                 # mask is already processed in MMDiT.forward of mimogpt/models/dit/mmdit.py
                 pass
 
+            # --- BLADE ASA quality probe: optional video<->video block-sparse mask ---
+            # Builds a True=masked attention mask and ORs it into the existing mask.
+            # No speedup (dense FA still computes masked positions); quality probe only.
+            from .mmdit_asa import AsaConfig, build_asa_block_mask, should_apply_asa
+            _asa_cfg = AsaConfig.from_env()
+            _asa_layer = getattr(self, '_debug_block_idx', -1)
+            _asa_step = getattr(self, 'cur_time_index', None)
+            if (should_apply_asa(_asa_cfg, _asa_layer, _asa_step, self.downscale)
+                    and not isinstance(mask, list)):
+                _asa_mask = build_asa_block_mask(
+                    q, k, T, L, _asa_cfg.block, _asa_cfg.tau,
+                    (C // self.n_head) ** -0.5,
+                    log=_asa_cfg.log, layer=_asa_layer, step=_asa_step,
+                )
+                mask = _asa_mask if mask is None else (mask | _asa_mask)
+
             out = self.fa(q, k, v, mask, C, offload_fa=False)
 
             if self.downscale != 1:

@@ -127,6 +127,8 @@ class MMDiTBlockInference(MMDiTBlock):
 
         # Propagate block_idx to JoinAttentionInference for internal debug
         self.attention._debug_block_idx = block_idx
+        # Propagate step index (set by blocks_forward / cache path) for ASA scope.
+        self.attention.cur_time_index = getattr(self, 'cur_time_index', None)
 
         x1, y1 = self.attention.infer(
             x1, y1, x1_cts, spatial_freq,
