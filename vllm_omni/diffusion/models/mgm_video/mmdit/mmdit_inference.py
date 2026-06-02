@@ -111,6 +111,14 @@ class MMDiTBlockInference(MMDiTBlock):
     def forward(self, x, y, t, x_padding_size, y_padding_size, mask=None, spatial_freq=None, num_layer=-1, f=None, hh=None, ww=None, skip_compute=False):
         if skip_compute: # skip compute, but load others
             return x, y
+        # [ASA-PROBE-P2] block forward entry
+        import os as _os
+        if _os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+            print(f"[ASA-PROBE][P2 block-forward] num_layer={num_layer} "
+                  f"step={getattr(self, 'cur_time_index', None)} "
+                  f"x.shape={tuple(x.shape)} y.shape={tuple(y.shape)} "
+                  f"mask={'None' if mask is None else (type(mask).__name__ + str(getattr(mask, 'shape', '?')))}",
+                  flush=True)
         x1_cts = None
         B = x.shape[0]
         block_idx = MMDiTBlockInference._debug_block_idx
@@ -212,6 +220,14 @@ class MMDiTInference(MMDiT):
         return result
 
     def blocks_forward(self, x, y, t, x_padding_size, y_padding_size, mask, spatial_freq, fn, base_size_h, base_size_w, **kwargs):
+        # [ASA-PROBE-P1] blocks_forward entry
+        import os as _os
+        if _os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+            print(f"[ASA-PROBE][P1 blocks_forward-enter] step={kwargs.get('cur_time_index')} "
+                  f"x.shape={tuple(x.shape)} y.shape={tuple(y.shape)} "
+                  f"mask={'None' if mask is None else (type(mask).__name__ + str(getattr(mask, 'shape', '?')))} "
+                  f"cache_algo_enable={self.cache_algo_enable}",
+                  flush=True)
         if spatial_freq is not None:
             spatial_freq = self._convert_spatial_freq_for_inference(spatial_freq)
         # Reset block debug counter for each forward pass (each denoising step)

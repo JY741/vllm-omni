@@ -147,6 +147,14 @@ class JoinAttentionInference(JoinAttention):
 
         _is_block0 = getattr(self, '_debug_block_idx', -1) == 0
 
+        # [ASA-PROBE-P3] infer entry — confirms control reached attention call
+        if os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+            print(f"[ASA-PROBE][P3 infer-enter] block={getattr(self, '_debug_block_idx', -1)} "
+                  f"step={getattr(self, 'cur_time_index', None)} "
+                  f"x.shape={tuple(x.shape)} y.shape={tuple(y.shape)} "
+                  f"mask={'None' if mask is None else (type(mask).__name__ + str(getattr(mask, 'shape', '?')))}",
+                  flush=True)
+
         B, T, C = x.size()  # batch size, sequence length, embedding dimensionality (n_embd)
         qkv_x_out = self.qkv_x(x)
         q_x, k_x, v_x = qkv_x_out.split(self.n_embd, dim=2)
@@ -303,14 +311,32 @@ class JoinAttentionInference(JoinAttention):
             _asa_cfg = AsaConfig.from_env()
             _asa_layer = getattr(self, '_debug_block_idx', -1)
             _asa_step = getattr(self, 'cur_time_index', None)
+            # [ASA-PROBE-P4] reached ASA decision point
+            if os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+                _decision = should_apply_asa(_asa_cfg, _asa_layer, _asa_step, self.downscale)
+                print(f"[ASA-PROBE][P4 asa-decision] idx={idx} layer={_asa_layer} step={_asa_step} "
+                      f"downscale={self.downscale} mask_is_list={isinstance(mask, list)} "
+                      f"q.shape={tuple(q.shape)} k.shape={tuple(k.shape)} T={T} L={L} "
+                      f"will_apply={_decision and not isinstance(mask, list)}",
+                      flush=True)
             if (should_apply_asa(_asa_cfg, _asa_layer, _asa_step, self.downscale)
                     and not isinstance(mask, list)):
+                # [ASA-PROBE-P5] just before build_asa_block_mask
+                if os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+                    print(f"[ASA-PROBE][P5 pre-build] layer={_asa_layer} step={_asa_step} "
+                          f"calling build_asa_block_mask...", flush=True)
                 _asa_mask = build_asa_block_mask(
                     q, k, T, L, _asa_cfg.block, _asa_cfg.tau,
                     (C // self.n_head) ** -0.5,
                     log=_asa_cfg.log, layer=_asa_layer, step=_asa_step,
                 )
+                if os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+                    print(f"[ASA-PROBE][P6 post-build] layer={_asa_layer} step={_asa_step} "
+                          f"asa_mask.shape={tuple(_asa_mask.shape)}", flush=True)
                 mask = _asa_mask if mask is None else (mask | _asa_mask)
+                if os.environ.get("VLLM_MGM_ASA_PROBE", "0") == "1":
+                    print(f"[ASA-PROBE][P7 post-or] layer={_asa_layer} step={_asa_step} "
+                          f"mask.shape={tuple(mask.shape)} mask.dtype={mask.dtype}", flush=True)
 
             out = self.fa(q, k, v, mask, C, offload_fa=False)
 
