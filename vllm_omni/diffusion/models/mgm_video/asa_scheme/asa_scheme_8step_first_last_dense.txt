@@ -1,0 +1,10 @@
+# ASA step scheme: 8-step run with first and last step dense.
+# 1 = run ASA, 0 = run dense full attention.
+0
+1
+1
+1
+1
+1
+1
+0

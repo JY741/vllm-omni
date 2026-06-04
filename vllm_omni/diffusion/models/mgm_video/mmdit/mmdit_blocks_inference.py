@@ -43,7 +43,8 @@ if find_spec("mindiesd") is not None:
 
 class JoinAttentionInference(JoinAttention):
     def __init__(self, n_embd, n_head, dropout=0.0, fa_keep_prob=1.0, use_3d_rope=True, use_qknorm=True,
-                 use_rmsnorm=False, use_context_parallelism=False, depth=-1, down_mode=None, downscale=1, index=0, laser_atten=False):
+                 use_rmsnorm=False, use_context_parallelism=False, depth=-1, down_mode=None, downscale=1, index=0, laser_atten=False,
+                 asa_cfg=None):
         super().__init__(
             n_embd, n_head, dropout=dropout, fa_keep_prob=fa_keep_prob, use_3d_rope=use_3d_rope, use_qknorm=use_qknorm,
             use_rmsnorm=use_rmsnorm, use_context_parallelism=use_context_parallelism, depth=depth, down_mode=down_mode,
@@ -52,6 +53,46 @@ class JoinAttentionInference(JoinAttention):
         self.laser_atten = laser_atten
         self.rope = RotaryEmbedding(is_neox_style=False)
         self._mindiesd_rope = _MINDIESD_ROPE
+        self.asa_cfg = asa_cfg
+        self._asa_rearranger = None  # lazy init in infer()
+        # P4.6: per-step ASA on/off scheme. Lazy-loaded once per attention
+        # instance, keyed by path so a config swap (rare) reloads.
+        self._asa_step_scheme: tuple[int, ...] | None = None
+        self._asa_scheme_path_loaded: str | None = None
+
+    def _should_use_dense_for_step(self, step_idx, asa_cfg) -> bool:
+        """Per-step gate: returns True iff this step should run dense
+        full attention instead of ASA.
+
+        Precedence (P4.6 over P4.5):
+        - If asa_cfg.step_scheme_path is set, the scheme file fully
+          controls the gate (warmup_steps is ignored).
+            * scheme[step_idx] == 0  -> True  (dense)
+            * scheme[step_idx] == 1  -> False (ASA)
+            * step_idx is None or out-of-range -> False (fall through to ASA)
+        - Else fall back to P4.5 warmup logic:
+            * step_idx is None             -> False
+            * step_idx <  warmup_steps     -> True  (warmup: dense)
+            * step_idx >= warmup_steps     -> False (regular: ASA)
+        """
+        scheme_path = getattr(asa_cfg, "step_scheme_path", None)
+        if scheme_path is not None:
+            # Lazy-load + cache; reload if the configured path changed.
+            if (
+                self._asa_step_scheme is None
+                or self._asa_scheme_path_loaded != scheme_path
+            ):
+                from .asa import parse_asa_step_scheme
+                self._asa_step_scheme = parse_asa_step_scheme(scheme_path)
+                self._asa_scheme_path_loaded = scheme_path
+            scheme = self._asa_step_scheme
+            if step_idx is None or step_idx < 0 or step_idx >= len(scheme):
+                return False
+            return scheme[step_idx] == 0
+        # No scheme: fall back to warmup_steps gate.
+        if step_idx is None:
+            return False
+        return step_idx < asa_cfg.warmup_steps
 
     def la(self, query, key, value):
         query = query.transpose(1,2)
@@ -296,7 +337,45 @@ class JoinAttentionInference(JoinAttention):
                 # mask is already processed in MMDiT.forward of mimogpt/models/dit/mmdit.py
                 pass
 
-            out = self.fa(q, k, v, mask, C, offload_fa=False)
+            asa_cfg = self.asa_cfg
+            if asa_cfg is not None and asa_cfg.enable:
+                step_idx = getattr(self, '_current_step_idx', None)
+                # Per-step gate (P4.6 scheme file overrides P4.5 warmup_steps)
+                if self._should_use_dense_for_step(step_idx, asa_cfg):
+                    # Dense full attention via original mask path.
+                    out = self.fa(q, k, v, mask, C, offload_fa=False)
+                else:
+                    # Runtime tensor shape is source of truth; cfg.text_length is
+                    # only a hint for env-var users. Derive L from q.shape and
+                    # build the rearranger from runtime (ww, hh, f, L).
+                    T_seg = f * hh * ww
+                    L_seg = q.shape[-2] - T_seg
+                    if self._asa_rearranger is None:
+                        from .asa import GilbertRearranger
+                        self._asa_rearranger = GilbertRearranger(
+                            width=ww, height=hh, depth=f, text_length=L_seg,
+                        ).to(q.device)
+                        self._asa_video_shape = (ww, hh, f, L_seg)
+                    else:
+                        assert self._asa_video_shape == (ww, hh, f, L_seg), \
+                            f"shape changed: {self._asa_video_shape} -> {(ww, hh, f, L_seg)}"
+
+                    def _fa_full_dense(qq, kk, vv, atten_mask):
+                        # asa.py uses SDPA convention (True = keep). self.fa's
+                        # npu_fusion_attention path uses the opposite convention
+                        # (True = mask out), matching the baseline mask built at
+                        # lines 287-289 above. Invert here so both unit tests
+                        # (SDPA-backed) and runtime (NPU FA) see the contract
+                        # they expect.
+                        if atten_mask is not None:
+                            atten_mask = atten_mask.logical_not()
+                        return self.fa(qq, kk, vv, atten_mask, C, offload_fa=False)
+
+                    from .asa import asa_attention
+                    out = asa_attention(q, k, v, asa_cfg, self._asa_rearranger,
+                                        t_len=T_seg, l_len=L_seg, fa_full_dense=_fa_full_dense)
+            else:
+                out = self.fa(q, k, v, mask, C, offload_fa=False)
 
             if self.downscale != 1:
                 # after_fa, first skiparse (reverse reorganize S, out), then CP (restore head1, split S),

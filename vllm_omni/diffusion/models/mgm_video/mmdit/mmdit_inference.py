@@ -89,6 +89,7 @@ class MMDiTBlockInference(MMDiTBlock):
             downscale=1,
             index=0,
             laser_atten=False,
+            asa_cfg=None,
     ):
         super().__init__(
             n_embd=n_embd, n_head=n_head, dropout=dropout, fa_keep_prob=fa_keep_prob, use_checkpoint=use_checkpoint,
@@ -104,6 +105,7 @@ class MMDiTBlockInference(MMDiTBlock):
 			use_context_parallelism=use_context_parallelism,
             depth=depth, down_mode=down_mode, downscale=downscale, index=index,
             laser_atten=laser_atten,
+            asa_cfg=asa_cfg,
 		)
 
     _debug_block_idx = 0  # class-level counter for debug printing
@@ -127,6 +129,8 @@ class MMDiTBlockInference(MMDiTBlock):
 
         # Propagate block_idx to JoinAttentionInference for internal debug
         self.attention._debug_block_idx = block_idx
+        # Propagate step index for ASA step-warmup gate (P4.5)
+        self.attention._current_step_idx = getattr(self, '_current_step_idx', None)
 
         x1, y1 = self.attention.infer(
             x1, y1, x1_cts, spatial_freq,
@@ -159,7 +163,8 @@ class MMDiTInference(MMDiT):
                  class_dropout_prob=0.1, pred_sigma=False, caption_channels=4096, lewei_scale=1.0, dropout=0.0, fa_keep_prob=1.0,
                  model_max_length=200, use_rel_pos=True, use_3d_rope=True, rope_ratio=[22/64, 22/64, 20/64], use_size_control=False, use_checkpoint=True,
                  checkpoint_finegrained_layer=0, checkpoint_layer=-1, use_mmdit_block=True, dtype='bf16', use_context_parallelism=False, offload_fa=False,
-                 skiparse=None, skip_initialize_weights=True, x2v=False, cond_intype='sum', out_channels=16, cache_algo_cfg=None, laser_atten=False):
+                 skiparse=None, skip_initialize_weights=True, x2v=False, cond_intype='sum', out_channels=16, cache_algo_cfg=None, laser_atten=False,
+                 asa_cfg=None):
         super().__init__(
             max_input_size=max_input_size, patch_size=patch_size, in_channels=in_channels, hidden_size=hidden_size, depth=depth, head_dim=head_dim,
             class_dropout_prob=class_dropout_prob, pred_sigma=pred_sigma, caption_channels=caption_channels, lewei_scale=lewei_scale, dropout=dropout,
@@ -171,7 +176,8 @@ class MMDiTInference(MMDiT):
         self.blocks = nn.ModuleList([
             MMDiTBlockInference(n_embd=hidden_size, n_head=self.num_heads, dropout=dropout, fa_keep_prob=fa_keep_prob, use_checkpoint=use_checkpoint,
             checkpoint_finegrained_layer=self.checkpoint_finegrained_layer, checkpoint_layer=self.checkpoint_layer, use_context_parallelism=use_context_parallelism,
-            offload_fa=self.offload_fa, depth=depth, down_mode=self.down_mode, downscale=self.downscale[i], index=i, laser_atten=laser_atten)
+            offload_fa=self.offload_fa, depth=depth, down_mode=self.down_mode, downscale=self.downscale[i], index=i, laser_atten=laser_atten,
+            asa_cfg=asa_cfg)
             for i in range(depth)
         ])
 
@@ -367,6 +373,7 @@ def mmdit_xl_2_inference(
     class_dropout_prob=0.1,
     lewei_scale=1.0,
     use_size_control=False,
+    asa_cfg=None,
 ):
     if rope_ratio is None:
         rope_ratio = [22/64, 22/64, 20/64]
@@ -401,6 +408,7 @@ def mmdit_xl_2_inference(
         class_dropout_prob=class_dropout_prob,
         lewei_scale=lewei_scale,
         use_size_control=use_size_control,
+        asa_cfg=asa_cfg,
     )
     model = MMDiTInference(**config)
     return model

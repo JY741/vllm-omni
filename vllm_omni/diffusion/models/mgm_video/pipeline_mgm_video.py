@@ -105,6 +105,13 @@ def create_transformer_from_config(
     kwargs["skip_initialize_weights"] = True
     kwargs["cache_algo_cfg"] = cache_algo_cfg
 
+    # ASA quality probe hook: only allocate AsaConfig when env var enables it,
+    # otherwise leave kwargs["asa_cfg"] unset so mmdit defaults to None and
+    # the production path is bit-for-bit unchanged.
+    if os.environ.get("VLLM_MGM_ASA_ENABLE") == "1":
+        from vllm_omni.diffusion.models.mgm_video.mmdit.asa import AsaConfig
+        kwargs["asa_cfg"] = AsaConfig.from_env()
+
     return mmdit_xl_2_inference(**kwargs)
 
 
