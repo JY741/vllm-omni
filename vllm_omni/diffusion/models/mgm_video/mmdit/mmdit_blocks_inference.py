@@ -59,6 +59,9 @@ class JoinAttentionInference(JoinAttention):
         # instance, keyed by path so a config swap (rare) reloads.
         self._asa_step_scheme: tuple[int, ...] | None = None
         self._asa_scheme_path_loaded: str | None = None
+        # STA block-mask cache (lazy; rebuilt on (T,H,W,block_size,window) change)
+        from .sta import StaMaskCache
+        self._sta_cache = StaMaskCache()
 
     def _should_use_dense_for_step(self, step_idx, asa_cfg) -> bool:
         """Per-step gate: returns True iff this step should run dense
@@ -373,7 +376,8 @@ class JoinAttentionInference(JoinAttention):
 
                     from .asa import asa_attention
                     out = asa_attention(q, k, v, asa_cfg, self._asa_rearranger,
-                                        t_len=T_seg, l_len=L_seg, fa_full_dense=_fa_full_dense)
+                                        t_len=T_seg, l_len=L_seg, fa_full_dense=_fa_full_dense,
+                                        sta_cache=self._sta_cache)
             else:
                 out = self.fa(q, k, v, mask, C, offload_fa=False)
 

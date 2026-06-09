@@ -91,6 +91,10 @@ def parse_args():
         help="Use Context Parallelism (Ulysses degree=2) + DiT layerwise offload, "
              "matching mgm_video_t2v.py's --use-cp 2-NPU mode.",
     )
+    p.add_argument("--enable-sta", action="store_true",
+                   help="Enable STA hybrid OR with ASA (sets VLLM_MGM_STA_ENABLE=1)")
+    p.add_argument("--sta-window", default="7,13,13",
+                   help="STA window 'wT,wH,wW' (default 7,13,13). Used only when --enable-sta is set.")
     return p.parse_args()
 
 
@@ -111,6 +115,14 @@ def build_pipeline(model: str, asa_cfg, args):
         os.environ["VLLM_MGM_ASA_TEXT_LEN"] = str(asa_cfg.text_length)
     else:
         os.environ.pop("VLLM_MGM_ASA_ENABLE", None)
+
+    # STA hybrid (Task 7 of 2026-06-08 plan)
+    if getattr(args, "enable_sta", False):
+        os.environ["VLLM_MGM_STA_ENABLE"] = "1"
+        os.environ["VLLM_MGM_STA_WINDOW"] = args.sta_window
+    else:
+        os.environ.pop("VLLM_MGM_STA_ENABLE", None)
+        os.environ.pop("VLLM_MGM_STA_WINDOW", None)
 
     if args.use_cp:
         parallel_config = DiffusionParallelConfig(

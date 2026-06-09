@@ -170,3 +170,39 @@ export VLLM_MGM_ASA_WARMUP_STEPS=N       # N ∈ {0, 1, 2, 3}
 - R6 asa@0.20 PSNR 崩溃：未触发 / 触发（处理：xx）
 - R7 NPU cumsum bf16 精度：未触发 / 触发（处理：xx）
 - R8 text_length 不匹配运行时：未触发 / 触发（处理：xx）
+
+## ASA + STA hybrid (NABLA-style OR) — 2026-06-08
+
+**Hypothesis:** ASA's noise-points regression stems from over-pruning the
+local 3D neighborhood of each video token. OR'ing in a static STA
+neighborhood mask should restore those local edges while preserving ASA's
+long-range routing.
+
+**Spec:** `docs/superpowers/specs/2026-06-08-mgm-video-sta-hybrid-design.md`
+**Plan:** `docs/superpowers/plans/2026-06-08-mgm-video-sta-hybrid.md`
+
+**Configurations probed:**
+- Pure ASA (baseline from earlier section)
+- ASA + STA(7, 13, 13) (default)
+- ASA + STA(9, 15, 15) (looser)
+- Dense (reference)
+
+**Probe command (per config):**
+
+```bash
+python scripts/probe_mgm_asa.py \
+    --model /path/to/mgm_video_11b_vllm \
+    --output-dir runs/asa_sta_probe \
+    --enable-sta --sta-window 7,13,13
+```
+
+**Results:** _(filled after probe runs)_
+
+| Config | Visible noise points? | VBench-like spot check | Wall-clock |
+|---|---|---|---|
+| Pure ASA | TBD | TBD | TBD |
+| ASA + STA(7,13,13) | TBD | TBD | TBD |
+| ASA + STA(9,15,15) | TBD | TBD | TBD |
+| Dense | TBD | TBD | TBD |
+
+**Conclusion:** _(filled after probe runs)_

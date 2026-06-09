@@ -9,6 +9,7 @@ npu_fusion_attention. No new NPU kernel introduced.
 See: docs/superpowers/specs/2026-06-02-mgm-video-asa-adaptation-design.md
 """
 
+import logging
 import math
 import os
 from dataclasses import dataclass
@@ -16,6 +17,8 @@ from typing import Literal
 
 import torch
 import torch.nn as nn
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -34,12 +37,32 @@ class AsaConfig:
     collect_stats: bool = False
     warmup_steps: int = 0
     step_scheme_path: str | None = None
+    # STA hybrid (NABLA-style OR). See docs/superpowers/specs/2026-06-08-mgm-video-sta-hybrid-design.md
+    sta_enable: bool = False
+    sta_window: tuple[int, int, int] = (7, 13, 13)  # (wT, wH, wW), full extent
 
     @classmethod
     def from_env(cls) -> "AsaConfig":
         def _f(name, default, cast):
             v = os.environ.get(name)
             return cast(v) if v is not None else default
+
+        def _parse_window(s: str) -> tuple[int, int, int]:
+            parts = s.split(",")
+            if len(parts) != 3:
+                raise ValueError(f"expected 3 comma-separated ints, got {s!r}")
+            return (int(parts[0]), int(parts[1]), int(parts[2]))
+
+        sta_window = cls.__dataclass_fields__["sta_window"].default
+        raw_window = os.environ.get("VLLM_MGM_STA_WINDOW")
+        if raw_window is not None:
+            try:
+                sta_window = _parse_window(raw_window)
+            except ValueError as exc:
+                log.warning(
+                    "VLLM_MGM_STA_WINDOW=%r malformed (%s); falling back to default %r",
+                    raw_window, exc, sta_window,
+                )
 
         return cls(
             enable=_f("VLLM_MGM_ASA_ENABLE", False, lambda v: v == "1"),
@@ -55,6 +78,8 @@ class AsaConfig:
             collect_stats=_f("VLLM_MGM_ASA_COLLECT_STATS", False, lambda v: v == "1"),
             warmup_steps=_f("VLLM_MGM_ASA_WARMUP_STEPS", 0, int),
             step_scheme_path=_f("VLLM_MGM_ASA_STEP_SCHEME", None, str),
+            sta_enable=_f("VLLM_MGM_STA_ENABLE", False, lambda v: v == "1"),
+            sta_window=sta_window,
         )
 
 
@@ -450,6 +475,7 @@ def asa_attention(
     l_len: int,
     fa_full_dense,
     generator: torch.Generator | None = None,
+    sta_cache: "StaMaskCache | None" = None,
 ) -> torch.Tensor:
     """ASA forward (A subphase: variant in {'dense_probe', 'asa'}).
 
@@ -462,6 +488,8 @@ def asa_attention(
                        npu_fusion_attention; supplied by caller to keep this
                        module free of torch_npu coupling for unit tests.
         generator: optional torch.Generator for deterministic sampling
+        sta_cache: optional StaMaskCache. Required when cfg.sta_enable=True
+                   and cfg.variant == 'asa'.
     Returns:
         out: [B, N, T+L, D]
     """
@@ -479,6 +507,8 @@ def asa_attention(
         q_g, k_g, v_g = q, k, v
 
     if cfg.variant == "dense_probe":
+        if cfg.sta_enable:
+            log.info("sta_enable ignored under variant='dense_probe' (no-op OR)")
         m_token = None  # treat as full attention
     else:
         # 2. block importance estimation (head-mean shared)
@@ -486,13 +516,41 @@ def asa_attention(
             imp = sample_pool_attn(q_g, k_g, cfg.block_size, cfg.num_keep, generator)
             # 3. energy-threshold mask
             m_block = build_asa_block_mask(imp, cfg.max_retain_ratio, cfg.min_retain_ratio, cfg.energy_threshold)
-            # 4. expand to dense token mask (video x video only)
+            # 4. OR-combine with STA block mask when enabled
+            if cfg.sta_enable:
+                if sta_cache is None:
+                    raise ValueError(
+                        "asa_attention: sta_cache must be provided when "
+                        "cfg.sta_enable=True"
+                    )
+                from .sta import validate_and_normalize_window
+                T_grid, H_grid, W_grid = rearranger.depth, rearranger.height, rearranger.width
+                normalized = validate_and_normalize_window(
+                    cfg.sta_window, grid=(T_grid, H_grid, W_grid),
+                )
+                if normalized != cfg.sta_window:
+                    log.warning(
+                        "STA window %r normalized to %r (grid=(T=%d,H=%d,W=%d))",
+                        cfg.sta_window, normalized, T_grid, H_grid, W_grid,
+                    )
+                B, _, nq, nk = m_block.shape
+                m_sta = sta_cache.get_or_build(
+                    T=T_grid, H=H_grid, W=W_grid,
+                    block_size=cfg.block_size,
+                    n_blocks_total=nq,
+                    n_video_tokens=rearranger.total_video,
+                    gilbert2original=rearranger.gilbert2original,
+                    window=normalized,
+                    device=m_block.device,
+                )
+                m_block = m_block | m_sta
+            # 5. expand to dense token mask (video x video only)
             m_token = expand_block_to_token_mask(m_block, cfg.block_size, t_len, l_len)
 
-    # 5. flash attention with dense atten_mask (or None for dense_probe)
+    # 6. flash attention with dense atten_mask (or None for dense_probe)
     out_g = fa_full_dense(q_g, k_g, v_g, m_token)
 
-    # 6. inverse Gilbert
+    # 7. inverse Gilbert
     if cfg.use_gilbert:
         out = rearranger.reversed_rearrange(out_g)
     else:
