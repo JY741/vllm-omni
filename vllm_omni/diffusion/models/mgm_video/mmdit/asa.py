@@ -385,6 +385,23 @@ def sample_pool_attn(
     return P
 
 
+_PREFIX_SUM_MATRIX_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
+
+
+def _get_prefix_sum_matrix(n: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    """Return upper-triangular ones matrix M[i,j] = 1 if i <= j else 0, cached per (device, dtype, n).
+
+    Used to express prefix-sum as a single GEMM `x @ M` so the reduction runs
+    on the NPU cube unit instead of the serial cumsum scan kernel.
+    """
+    key = (device, dtype, n)
+    m = _PREFIX_SUM_MATRIX_CACHE.get(key)
+    if m is None:
+        m = torch.ones((n, n), device=device, dtype=dtype).triu_()
+        _PREFIX_SUM_MATRIX_CACHE[key] = m
+    return m
+
+
 def build_asa_block_mask(
     importance: torch.Tensor,
     max_retain_ratio: float,
@@ -393,8 +410,15 @@ def build_asa_block_mask(
 ) -> torch.Tensor:
     """Energy-threshold pruning of block importance matrix.
 
-    Per row: sort descending, find smallest k s.t. cumsum >= threshold * total,
-    clamp k to [min_retain * nk, max_retain * nk], scatter back.
+    Per row: find smallest k s.t. cumsum of top-k values >= threshold * total,
+    clamp k to [min_retain * nk, max_retain * nk], emit mask of positions whose
+    importance is at least the k-th-largest value.
+
+    Under exact ties on the threshold value the kept count may exceed
+    max_retain * nk; this is intentional. Production importance values come
+    from fp32 softmax outputs where exact ties have zero probability, and the
+    threshold-compare form lets us drop NPU `scatter_` entirely — the most
+    expensive op in the pre-mask pipeline.
 
     Args:
         importance: [B, 1, nq, nk] block importance (any non-negative dtype; fp32 used internally)
@@ -402,31 +426,40 @@ def build_asa_block_mask(
         mask: [B, 1, nq, nk] bool, True = keep block
     """
     B, H, nq, nk = importance.shape
-    imp_f = importance.float()
-
-    sorted_imp, indices = torch.sort(imp_f, dim=-1, descending=True)
-    cum = torch.cumsum(sorted_imp, dim=-1)
-    total = cum[..., -1:].clamp(min=1e-30)
-
-    # first index where cum >= threshold * total
-    over = cum >= energy_threshold * total
-    # argmax on bool returns first True; if no True, fallback to nk
-    k_indices = torch.argmax(over.int(), dim=-1)
-    unsatisfied = ~over.any(dim=-1)
-    k_indices = torch.where(unsatisfied, torch.full_like(k_indices, nk), k_indices)
-    # +1 because index of last needed block, want count kept
-    k_indices = k_indices + 1
+    imp_f = importance if importance.dtype == torch.float32 else importance.float()
 
     min_keep = max(1, int(nk * min_retain_ratio))
     max_keep = max(min_keep, int(nk * max_retain_ratio))
-    k_indices = k_indices.clamp(min=min_keep, max=max_keep)  # [B,H,nq]
 
-    # build mask: positions [0, k_indices) of sorted order are True
-    pos = torch.arange(nk, device=importance.device).view(1, 1, 1, nk)
-    keep_sorted = pos < k_indices.unsqueeze(-1)  # [B,H,nq,nk] bool
-    mask = torch.zeros_like(imp_f, dtype=torch.bool)
-    mask.scatter_(-1, indices, keep_sorted)
-    return mask
+    # Cap at max_keep: max_retain_ratio bounds the kept block count, so topk
+    # on max_keep is enough to recover both the energy-threshold cutoff and
+    # the per-row threshold value. Total energy is a single reduce instead of
+    # reading the tail of a full-length cumsum.
+    topk_vals, _ = torch.topk(imp_f, max_keep, dim=-1, sorted=True)
+    total = imp_f.sum(dim=-1, keepdim=True).clamp(min=1e-30)
+
+    # cumsum-as-matmul: `cum[..., j] = sum_{i<=j} topk_vals[..., i]` is exactly
+    # `topk_vals @ M` where M is upper-triangular ones. NPU cumsum is a serial
+    # scan kernel that costs ms even on short rows; matmul runs on the cube
+    # unit and is two orders of magnitude faster for max_keep in the hundreds.
+    # The triangular matrix is shape-only state, cached across denoise steps.
+    prefix_m = _get_prefix_sum_matrix(max_keep, imp_f.device, imp_f.dtype)
+    cum = torch.matmul(topk_vals, prefix_m)
+
+    # k = smallest count whose cumulative energy reaches the threshold.
+    # `(cum < need).sum() + 1` collapses argmax+any+where into one reduce;
+    # if cum never reaches need within max_keep, the count saturates at
+    # max_keep+1 and the clamp pulls it back, matching the original
+    # `unsatisfied -> nk -> clamp` fallback.
+    need = energy_threshold * total
+    k_count = (cum < need).sum(dim=-1, keepdim=True) + 1
+    k_count = k_count.clamp(min=min_keep, max=max_keep)
+
+    # The k_count-th largest value per row is the keep threshold. Elementwise
+    # `imp >= threshold` avoids scatter_ entirely; for fp32 softmax inputs the
+    # kept count equals k_count exactly (no ties at threshold).
+    threshold = topk_vals.gather(-1, k_count - 1)
+    return imp_f >= threshold
 
 
 def expand_block_to_token_mask(

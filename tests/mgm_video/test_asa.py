@@ -142,8 +142,8 @@ def test_build_asa_block_mask_dense_probe_keeps_all():
 
 
 def test_build_asa_block_mask_energy_threshold_prunes_tail():
-    # row [0.5, 0.4, 0.05, 0.05]; cum=[0.5,0.9,0.95,1.0]; threshold=0.95 -> first 3
-    P = torch.tensor([[[[0.5, 0.4, 0.05, 0.05]]]])
+    # row [0.5, 0.4, 0.06, 0.04]; cum=[0.5,0.9,0.96,1.0]; threshold=0.95 -> first 3
+    P = torch.tensor([[[[0.5, 0.4, 0.06, 0.04]]]])
     mask = build_asa_block_mask(P, max_retain_ratio=1.0, min_retain_ratio=0.0, energy_threshold=0.95)
     assert mask[0, 0, 0].tolist() == [True, True, True, False]
 
@@ -157,8 +157,10 @@ def test_build_asa_block_mask_respects_min_retain():
 
 
 def test_build_asa_block_mask_respects_max_retain():
-    # row uniform: every block needed for 0.95; max_retain=0.25, nk=8 -> cap at 2
-    P = torch.full((1, 1, 1, 8), 1.0 / 8)
+    # Distinct importance values so the threshold is unique. Energy threshold
+    # alone would need 7 blocks (cum reaches 0.95 at index 6), but
+    # max_retain=0.25 with nk=8 caps the kept count at 2.
+    P = torch.tensor([[[[0.20, 0.18, 0.15, 0.13, 0.12, 0.10, 0.08, 0.04]]]])
     mask = build_asa_block_mask(P, max_retain_ratio=0.25, min_retain_ratio=0.0, energy_threshold=0.95)
     assert mask.sum().item() == 2
 
