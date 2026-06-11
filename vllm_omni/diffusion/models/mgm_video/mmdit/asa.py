@@ -351,38 +351,94 @@ def sample_pool_attn(
     num_keep: int,
     generator: torch.Generator | None = None,
 ) -> torch.Tensor:
-    """Estimate per-block attention importance via sampling.
+    """Estimate per-block attention importance via NABLA-style mean-pool.
+
+    NABLA reference: Wan2.1-NABLA/wan/modules/attention.py::nablaT (lines 260-270):
+        qa = q.reshape(B, h, S//bs, bs, D).mean(-2)
+        ka = k.reshape(B, h, S//bs, bs, D).mean(-2).transpose(-2, -1)
+        map = softmax((qa @ ka) / sqrt(D), dim=-1)
+
+    Compared to the original sampling-based path: replace per-block random
+    token sampling + intra-block max-pool with block mean-pool over the seq
+    dim, then a single block-level GEMM + softmax. `num_keep` becomes unused
+    but stays in the signature so the call site in `asa_attention` and the
+    cfg plumbing don't need to change. NABLA's doc-mask is a multi-segment
+    construct; here q/k carry a single (video+text) stream and downstream
+    `expand_block_to_token_mask` already forces video<->text to True, so we
+    drop the doc-mask term.
 
     Args:
         q, k: [B, N, L, D]   L need NOT be a multiple of block_size; we pad.
+        num_keep: unused under NABLA-style path; kept for signature compat.
     Returns:
         P: [B, 1, nq, nk] head-mean shared block importance (fp32)
         nq = nk = ceil(L / block_size)
     """
+    del num_keep, generator  # NABLA-style path is deterministic, no sampling
     B, N, L, D = q.shape
     q_pad = pad_to_multiple(q, block_size, dim=-2)
     k_pad = pad_to_multiple(k, block_size, dim=-2)
 
-    q_smp = random_sample_tokens(q_pad, block_size, num_keep, generator)  # [B,N,nq*ns,D]
-    k_smp = random_sample_tokens(k_pad, block_size, num_keep, generator)  # [B,N,nk*ns,D]
-
     nq = q_pad.shape[-2] // block_size
     nk = k_pad.shape[-2] // block_size
-    ns = num_keep
 
-    # small attention in fp32 for numerical stability
-    q_smp_f = q_smp.float()
-    k_smp_f = k_smp.float()
+    # Block-level mean pooling along seq dim (NABLA: qa/ka)
+    q_blk = q_pad.view(B, N, nq, block_size, D).mean(dim=-2)  # [B,N,nq,D]
+    k_blk = k_pad.view(B, N, nk, block_size, D).mean(dim=-2)  # [B,N,nk,D]
+
+    # Block-level small attention in fp32 for numerical stability
+    q_blk_f = q_blk.float()
+    k_blk_f = k_blk.float()
     scale = 1.0 / math.sqrt(D)
-    scores = torch.matmul(q_smp_f, k_smp_f.transpose(-1, -2)) * scale  # [B,N,nq*ns,nk*ns]
-    scores = torch.softmax(scores, dim=-1)
+    scores = torch.matmul(q_blk_f, k_blk_f.transpose(-1, -2)) * scale  # [B,N,nq,nk]
+    P = torch.softmax(scores, dim=-1)
 
-    # block max-pool over within-block dims
-    scores = scores.view(B, N, nq, ns, nk, ns)
-    P = scores.amax(dim=(3, 5))  # [B, N, nq, nk]
-    # head-mean share (see spec §3.2 step 4 / §4.2)
+    # head-mean share (matches downstream H=1 assumption in
+    # build_asa_block_mask / expand_block_to_token_mask).
     P = P.mean(dim=1, keepdim=True)  # [B, 1, nq, nk]
     return P
+
+
+# --- Original sampling-based importance estimator (kept for easy revert) ---
+# def sample_pool_attn(
+#     q: torch.Tensor,
+#     k: torch.Tensor,
+#     block_size: int,
+#     num_keep: int,
+#     generator: torch.Generator | None = None,
+# ) -> torch.Tensor:
+#     """Estimate per-block attention importance via sampling.
+#
+#     Args:
+#         q, k: [B, N, L, D]   L need NOT be a multiple of block_size; we pad.
+#     Returns:
+#         P: [B, 1, nq, nk] head-mean shared block importance (fp32)
+#         nq = nk = ceil(L / block_size)
+#     """
+#     B, N, L, D = q.shape
+#     q_pad = pad_to_multiple(q, block_size, dim=-2)
+#     k_pad = pad_to_multiple(k, block_size, dim=-2)
+#
+#     q_smp = random_sample_tokens(q_pad, block_size, num_keep, generator)  # [B,N,nq*ns,D]
+#     k_smp = random_sample_tokens(k_pad, block_size, num_keep, generator)  # [B,N,nk*ns,D]
+#
+#     nq = q_pad.shape[-2] // block_size
+#     nk = k_pad.shape[-2] // block_size
+#     ns = num_keep
+#
+#     # small attention in fp32 for numerical stability
+#     q_smp_f = q_smp.float()
+#     k_smp_f = k_smp.float()
+#     scale = 1.0 / math.sqrt(D)
+#     scores = torch.matmul(q_smp_f, k_smp_f.transpose(-1, -2)) * scale  # [B,N,nq*ns,nk*ns]
+#     scores = torch.softmax(scores, dim=-1)
+#
+#     # block max-pool over within-block dims
+#     scores = scores.view(B, N, nq, ns, nk, ns)
+#     P = scores.amax(dim=(3, 5))  # [B, N, nq, nk]
+#     # head-mean share (see spec §3.2 step 4 / §4.2)
+#     P = P.mean(dim=1, keepdim=True)  # [B, 1, nq, nk]
+#     return P
 
 
 _PREFIX_SUM_MATRIX_CACHE: dict[tuple[torch.device, torch.dtype, int], torch.Tensor] = {}
