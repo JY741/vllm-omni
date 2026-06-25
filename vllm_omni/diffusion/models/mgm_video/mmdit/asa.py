@@ -12,6 +12,7 @@ See: docs/superpowers/specs/2026-06-02-mgm-video-asa-adaptation-design.md
 import logging
 import math
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Literal
 
@@ -563,6 +564,7 @@ def asa_attention(
     t_len: int,
     l_len: int,
     fa_full_dense,
+    fa_block_sparse: Callable | None = None,
     generator: torch.Generator | None = None,
     sta_cache: "StaMaskCache | None" = None,
 ) -> torch.Tensor:
@@ -576,6 +578,10 @@ def asa_attention(
         fa_full_dense: callable (q, k, v, atten_mask) -> out [B,N,T+L,D] using
                        npu_fusion_attention; supplied by caller to keep this
                        module free of torch_npu coupling for unit tests.
+        fa_block_sparse: optional callable (q, k, v, block_mask) -> out [B,N,T+L,D]
+                         where block_mask is [B, 1, nq, nk] bool. Uses
+                         torch_npu.npu_block_sparse_attention. If provided
+                         and cfg.variant == "asa", it replaces the dense mask path.
         generator: optional torch.Generator for deterministic sampling
         sta_cache: optional StaMaskCache. Required when cfg.sta_enable=True
                    and cfg.variant == 'asa'.
@@ -595,6 +601,7 @@ def asa_attention(
     else:
         q_g, k_g, v_g = q, k, v
 
+    m_block = None
     if cfg.variant == "dense_probe":
         if cfg.sta_enable:
             log.info("sta_enable ignored under variant='dense_probe' (no-op OR)")
@@ -633,11 +640,25 @@ def asa_attention(
                     device=m_block.device,
                 )
                 m_block = m_block | m_sta
-            # 5. expand to dense token mask (video x video only)
-            m_token = expand_block_to_token_mask(m_block, cfg.block_size, t_len, l_len)
+            # 5. expand to dense token mask (video x video only) only when needed
+            if fa_block_sparse is not None:
+                # Block-sparse op uses the same block mask for the whole sequence.
+                # Force text-token blocks (and any block overlapping text) to
+                # attend to all keys, matching expand_block_to_token_mask semantics.
+                n_blocks_total = m_block.shape[-1]
+                n_text_start_block = t_len // cfg.block_size
+                if n_text_start_block < n_blocks_total:
+                    m_block[..., n_text_start_block:, :] = True
+                    m_block[..., :, n_text_start_block:] = True
+                m_token = None
+            else:
+                m_token = expand_block_to_token_mask(m_block, cfg.block_size, t_len, l_len)
 
-    # 6. flash attention with dense atten_mask (or None for dense_probe)
-    out_g = fa_full_dense(q_g, k_g, v_g, m_token)
+    # 6. flash attention dispatch
+    if cfg.variant == "asa" and fa_block_sparse is not None:
+        out_g = fa_block_sparse(q_g, k_g, v_g, m_block)
+    else:
+        out_g = fa_full_dense(q_g, k_g, v_g, m_token)
 
     # 7. inverse Gilbert
     if cfg.use_gilbert:

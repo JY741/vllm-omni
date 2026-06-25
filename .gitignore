@@ -247,3 +247,6 @@ tmp_test
 vllm_omni/_version.py
 # output files
 *.wav
+
+# Visual brainstorming companion artifacts
+.superpowers/

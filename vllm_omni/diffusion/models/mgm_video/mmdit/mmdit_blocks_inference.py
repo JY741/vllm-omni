@@ -26,6 +26,7 @@ try:
     '''ascend'''
     import torch_npu
 except Exception as e:
+    torch_npu = None
     print("training on gpu !!")
 
 try:
@@ -364,20 +365,37 @@ class JoinAttentionInference(JoinAttention):
                             f"shape changed: {self._asa_video_shape} -> {(ww, hh, f, L_seg)}"
 
                     def _fa_full_dense(qq, kk, vv, atten_mask):
-                        # asa.py uses SDPA convention (True = keep). self.fa's
-                        # npu_fusion_attention path uses the opposite convention
-                        # (True = mask out), matching the baseline mask built at
-                        # lines 287-289 above. Invert here so both unit tests
-                        # (SDPA-backed) and runtime (NPU FA) see the contract
-                        # they expect.
                         if atten_mask is not None:
                             atten_mask = atten_mask.logical_not()
                         return self.fa(qq, kk, vv, atten_mask, C, offload_fa=False)
 
+                    use_block_sparse = os.environ.get(
+                        "VLLM_MGM_USE_BLOCK_SPARSE_ATTN", "0"
+                    ) == "1"
+                    fa_block_sparse = None
+                    if use_block_sparse:
+                        if not hasattr(torch_npu, "npu_block_sparse_attention"):
+                            raise RuntimeError(
+                                "VLLM_MGM_USE_BLOCK_SPARSE_ATTN=1 but "
+                                "torch_npu.npu_block_sparse_attention is not available"
+                            )
+                        from .block_sparse_attn import npu_block_sparse_attention_wrapper
+
+                        def _fa_block_sparse(qq, kk, vv, block_mask):
+                            return npu_block_sparse_attention_wrapper(
+                                qq, kk, vv, block_mask, block_size=asa_cfg.block_size
+                            )
+
+                        fa_block_sparse = _fa_block_sparse
+
                     from .asa import asa_attention
-                    out = asa_attention(q, k, v, asa_cfg, self._asa_rearranger,
-                                        t_len=T_seg, l_len=L_seg, fa_full_dense=_fa_full_dense,
-                                        sta_cache=self._sta_cache)
+                    out = asa_attention(
+                        q, k, v, asa_cfg, self._asa_rearranger,
+                        t_len=T_seg, l_len=L_seg,
+                        fa_full_dense=_fa_full_dense,
+                        fa_block_sparse=fa_block_sparse,
+                        sta_cache=self._sta_cache,
+                    )
             else:
                 out = self.fa(q, k, v, mask, C, offload_fa=False)
 

@@ -457,3 +457,90 @@ def test_asa_config_from_env_reads_step_scheme(monkeypatch, tmp_path):
     monkeypatch.setenv("VLLM_MGM_ASA_STEP_SCHEME", str(p))
     cfg = AsaConfig.from_env()
     assert cfg.step_scheme_path == str(p)
+
+
+def test_asa_attention_uses_block_sparse_callback_when_provided():
+    """variant=asa with fa_block_sparse should invoke callback with block mask."""
+    torch.manual_seed(0)
+    W, H, Tdepth = 4, 3, 2
+    T = W * H * Tdepth  # 24
+    L = 5
+    B, N, D = 1, 2, 8
+
+    q = torch.randn(B, N, T + L, D)
+    k = torch.randn(B, N, T + L, D)
+    v = torch.randn(B, N, T + L, D)
+
+    cfg = AsaConfig(
+        enable=True, variant="asa", max_retain_ratio=0.5, min_retain_ratio=0.5,
+        energy_threshold=0.95, block_size=8, num_keep=4, use_gilbert=False, text_length=L,
+    )
+    rearr = GilbertRearranger(W, H, Tdepth, text_length=L)
+
+    captured = {}
+
+    def _mock_block_sparse(qq, kk, vv, block_mask, **kwargs):
+        captured["q"] = qq
+        captured["k"] = kk
+        captured["v"] = vv
+        captured["block_mask"] = block_mask
+        return torch.zeros_like(qq)
+
+    def _mock_full_dense(qq, kk, vv, atten_mask):
+        pytest.fail("dense callback should not be called when block sparse is provided")
+
+    asa_attention(
+        q, k, v, cfg, rearr,
+        t_len=T, l_len=L,
+        fa_full_dense=_mock_full_dense,
+        fa_block_sparse=_mock_block_sparse,
+    )
+
+    assert captured["block_mask"].dtype == torch.bool
+    # head-shared on entry; nq=nk=ceil((T+L)/block_size)=ceil(29/8)=4
+    assert captured["block_mask"].shape == (B, 1, 4, 4)
+    # Text blocks (from index T//block_size=3 onwards) must attend to all keys
+    assert captured["block_mask"][..., 3:, :].all()
+    assert captured["block_mask"][..., :, 3:].all()
+    assert captured["q"].shape == (B, N, T + L, D)
+
+
+def test_block_sparse_mask_conversion():
+    """Wrapper expands head-shared bool mask to per-head int8."""
+    from vllm_omni.diffusion.models.mgm_video.mmdit.block_sparse_attn import (
+        npu_block_sparse_attention_wrapper,
+    )
+    import vllm_omni.diffusion.models.mgm_video.mmdit.block_sparse_attn as bsamod
+
+    if bsamod.torch_npu is None:
+        pytest.skip("torch_npu not available")
+
+    B, N, nq, nk = 1, 4, 3, 3
+    block_mask = torch.tensor([[[[True, False, True],
+                                  [False, True, False],
+                                  [True, True, False]]]])  # [1,1,3,3]
+
+    # We cannot call NPU op on CPU, so verify the conversion logic by monkey-patching.
+    captured = {}
+
+    def _fake_npu_op(*args, **kwargs):
+        captured["mask"] = kwargs["block_sparse_mask"]
+        captured["kwargs"] = kwargs
+        return (torch.zeros(B, N, 8, 8), None)
+
+    original = bsamod.torch_npu.npu_block_sparse_attention
+    bsamod.torch_npu.npu_block_sparse_attention = _fake_npu_op
+    try:
+        q = torch.zeros(B, N, 8, 8)
+        k = torch.zeros(B, N, 8, 8)
+        v = torch.zeros(B, N, 8, 8)
+        out = npu_block_sparse_attention_wrapper(q, k, v, block_mask, block_size=8)
+    finally:
+        bsamod.torch_npu.npu_block_sparse_attention = original
+
+    assert captured["mask"].dtype == torch.int8
+    assert captured["mask"].shape == (B, N, nq, nk)
+    expected = block_mask.expand(-1, N, -1, -1).to(torch.int8)
+    assert torch.equal(captured["mask"], expected)
+    assert captured["kwargs"]["block_shape"] == [8, 8]
+    assert out.shape == q.shape
